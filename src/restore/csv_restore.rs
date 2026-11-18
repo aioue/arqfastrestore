@@ -132,12 +132,8 @@ pub fn parse_csv_str(content: &str) -> Result<Vec<CsvRow>> {
         }
         let fields = split_csv_line(line);
 
-        let get = |idx: usize| -> &str {
-            fields
-                .get(idx)
-                .map(|s| s.trim_matches('"'))
-                .unwrap_or("")
-        };
+        let get =
+            |idx: usize| -> &str { fields.get(idx).map(|s| s.trim_matches('"')).unwrap_or("") };
 
         let action = get(idx_action).trim().to_lowercase();
         if action != "restore" {
@@ -269,7 +265,7 @@ fn walk_targeted(
             || requested_paths
                 .range(prefix_slash.clone()..)
                 .next()
-                .map_or(false, |p| p.starts_with(&prefix_slash));
+                .is_some_and(|p| p.starts_with(&prefix_slash));
         if !any_match {
             return Ok(());
         }
@@ -351,8 +347,7 @@ fn read_tree_cached(
     let bytes = blob_reader
         .read_blob(loc)
         .with_context(|| format!("reading tree blob '{tree_id}'"))?;
-    let parsed =
-        (parse_tree)(&bytes).with_context(|| format!("parsing tree blob '{tree_id}'"))?;
+    let parsed = (parse_tree)(&bytes).with_context(|| format!("parsing tree blob '{tree_id}'"))?;
 
     if let Some(c) = cache {
         c.put(tree_id, &parsed);
@@ -428,13 +423,13 @@ pub fn items_from_csv(
     let rows = parse_csv(csv_path)?;
 
     if rows.is_empty() {
-        bail!("No rows with action=restore found in {}", csv_path.display());
+        bail!(
+            "No rows with action=restore found in {}",
+            csv_path.display()
+        );
     }
 
-    eprintln!(
-        "csv-restore: {} row(s) with action=restore",
-        rows.len()
-    );
+    eprintln!("csv-restore: {} row(s) with action=restore", rows.len());
 
     let mut requested_rows = Vec::new();
 
@@ -499,7 +494,11 @@ pub fn items_from_csv(
 
         let relevant_rows: Vec<RequestedRow> = unresolved
             .values()
-            .filter(|row| row.candidate_uuids.iter().any(|candidate| candidate == &uuid))
+            .filter(|row| {
+                row.candidate_uuids
+                    .iter()
+                    .any(|candidate| candidate == &uuid)
+            })
             .cloned()
             .collect();
 
@@ -665,7 +664,10 @@ mod tests {
         }
     }
 
-    fn test_context_with_two_versions(old_sha: &str, new_sha: &str) -> (tempfile::TempDir, TreeCache, UuidContext) {
+    fn test_context_with_two_versions(
+        old_sha: &str,
+        new_sha: &str,
+    ) -> (tempfile::TempDir, TreeCache, UuidContext) {
         let dir = tempdir().unwrap();
         let cache = TreeCache::open(&dir.path().join("trees.redb")).unwrap();
         cache.put(
@@ -686,7 +688,9 @@ mod tests {
         let ctx = UuidContext {
             storage_root: dir.path().to_path_buf(),
             decrypt: None,
-            parse_tree: std::sync::Arc::new(|_| anyhow::bail!("parse_tree should not be called in test")),
+            parse_tree: std::sync::Arc::new(|_| {
+                anyhow::bail!("parse_tree should not be called in test")
+            }),
             records: vec![
                 BackupRecord {
                     timestamp: 100,
@@ -736,7 +740,9 @@ mod tests {
         UuidContext {
             storage_root: dir.to_path_buf(),
             decrypt: None,
-            parse_tree: std::sync::Arc::new(|_| anyhow::bail!("parse_tree should not be called in test")),
+            parse_tree: std::sync::Arc::new(|_| {
+                anyhow::bail!("parse_tree should not be called in test")
+            }),
             records: recs,
         }
     }
@@ -755,7 +761,14 @@ mod tests {
         let ctx = test_context_with_records(
             dir.path(),
             &cache,
-            &[(1, &a, 1), (2, &c, 2), (3, &c, 3), (4, &c, 4), (5, &c, 5), (6, &b, 6)],
+            &[
+                (1, &a, 1),
+                (2, &c, 2),
+                (3, &c, 3),
+                (4, &c, 4),
+                (5, &c, 5),
+                (6, &b, 6),
+            ],
         );
         let csv_path = dir.path().join("test.csv");
         std::fs::write(
@@ -769,7 +782,8 @@ mod tests {
         contexts.insert("UUID1".to_string(), ctx);
         let dest_root = dir.path().join("restore");
 
-        let (items, not_found) = items_from_csv(&csv_path, &dest_root, &contexts, Some(&cache)).unwrap();
+        let (items, not_found) =
+            items_from_csv(&csv_path, &dest_root, &contexts, Some(&cache)).unwrap();
         assert!(not_found.is_empty(), "not found: {not_found:?}");
         let mut sizes: Vec<u64> = items.iter().map(|i| i.node.item_size).collect();
         sizes.sort();
@@ -785,7 +799,13 @@ mod tests {
         let ctx = test_context_with_records(
             dir.path(),
             &cache,
-            &[(100, &a, 10), (200, &a, 20), (300, &a, 30), (400, &a, 40), (500, &a, 50)],
+            &[
+                (100, &a, 10),
+                (200, &a, 20),
+                (300, &a, 30),
+                (400, &a, 40),
+                (500, &a, 50),
+            ],
         );
         let csv_path = dir.path().join("test.csv");
         std::fs::write(
@@ -796,8 +816,13 @@ mod tests {
         let mut contexts = HashMap::new();
         contexts.insert("UUID1".to_string(), ctx);
 
-        let (items, _) =
-            items_from_csv(&csv_path, &dir.path().join("restore"), &contexts, Some(&cache)).unwrap();
+        let (items, _) = items_from_csv(
+            &csv_path,
+            &dir.path().join("restore"),
+            &contexts,
+            Some(&cache),
+        )
+        .unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].node.item_size, 50);
     }
@@ -819,8 +844,13 @@ mod tests {
         contexts.insert("EMPTY".to_string(), empty);
         contexts.insert("HIT".to_string(), hit);
 
-        let (items, not_found) =
-            items_from_csv(&csv_path, &dir.path().join("restore"), &contexts, Some(&cache)).unwrap();
+        let (items, not_found) = items_from_csv(
+            &csv_path,
+            &dir.path().join("restore"),
+            &contexts,
+            Some(&cache),
+        )
+        .unwrap();
         assert!(not_found.is_empty());
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].node.item_size, 7);
@@ -984,7 +1014,8 @@ path,blob_sha,sources,action
         contexts.insert("UUID1".to_string(), ctx);
         let dest_root = dir.path().join("restore");
 
-        let (items, not_found) = items_from_csv(&csv_path, &dest_root, &contexts, Some(&cache)).unwrap();
+        let (items, not_found) =
+            items_from_csv(&csv_path, &dest_root, &contexts, Some(&cache)).unwrap();
         assert!(not_found.is_empty());
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].dest_path, dest_root.join("history/file-old.txt"));
@@ -1011,7 +1042,8 @@ path,blob_sha,sources,action
         contexts.insert("UUID1".to_string(), ctx);
         let dest_root = dir.path().join("restore");
 
-        let (items, not_found) = items_from_csv(&csv_path, &dest_root, &contexts, Some(&cache)).unwrap();
+        let (items, not_found) =
+            items_from_csv(&csv_path, &dest_root, &contexts, Some(&cache)).unwrap();
         assert!(not_found.is_empty());
         assert_eq!(items.len(), 2);
 
@@ -1023,11 +1055,20 @@ path,blob_sha,sources,action
                 .unwrap()
                 .to_string_lossy()
                 .replace('\\', "/");
-            by_dest.insert(rel, (item.node.data_blob_locs[0].identifier.clone(), item.node.item_size));
+            by_dest.insert(
+                rel,
+                (
+                    item.node.data_blob_locs[0].identifier.clone(),
+                    item.node.item_size,
+                ),
+            );
         }
 
         assert_eq!(by_dest.get("file.txt"), Some(&(new_sha.to_string(), 20)));
-        assert_eq!(by_dest.get("history/file-old.txt"), Some(&(old_sha.to_string(), 10)));
+        assert_eq!(
+            by_dest.get("history/file-old.txt"),
+            Some(&(old_sha.to_string(), 10))
+        );
     }
 
     #[test]
@@ -1067,7 +1108,9 @@ path,blob_sha,sources,action
         let ctx_miss = UuidContext {
             storage_root: dir.path().to_path_buf(),
             decrypt: None,
-            parse_tree: std::sync::Arc::new(|_| anyhow::bail!("parse_tree should not be called in test")),
+            parse_tree: std::sync::Arc::new(|_| {
+                anyhow::bail!("parse_tree should not be called in test")
+            }),
             records: vec![BackupRecord {
                 timestamp: 200,
                 root_tree_blob_loc: Some(test_blob_loc("root-miss")),
@@ -1079,7 +1122,9 @@ path,blob_sha,sources,action
         let ctx_hit = UuidContext {
             storage_root: dir.path().to_path_buf(),
             decrypt: None,
-            parse_tree: std::sync::Arc::new(|_| anyhow::bail!("parse_tree should not be called in test")),
+            parse_tree: std::sync::Arc::new(|_| {
+                anyhow::bail!("parse_tree should not be called in test")
+            }),
             records: vec![BackupRecord {
                 timestamp: 100,
                 root_tree_blob_loc: Some(test_blob_loc("root-hit")),
@@ -1094,7 +1139,8 @@ path,blob_sha,sources,action
         contexts.insert("UUID_HIT".to_string(), ctx_hit);
         let dest_root = dir.path().join("restore");
 
-        let (items, not_found) = items_from_csv(&csv_path, &dest_root, &contexts, Some(&cache)).unwrap();
+        let (items, not_found) =
+            items_from_csv(&csv_path, &dest_root, &contexts, Some(&cache)).unwrap();
         assert!(not_found.is_empty());
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].dest_path, dest_root.join("chosen/file.txt"));

@@ -328,9 +328,7 @@ mod tests {
         ) {
             (Ok(p), Ok(pw), Ok(b)) => (p, pw, b),
             _ => {
-                eprintln!(
-                    "SKIP: set ARQ5_TEST_PATH, ARQ5_TEST_PASSWORD, ARQ5_TEST_BUCKET to run"
-                );
+                eprintln!("SKIP: set ARQ5_TEST_PATH, ARQ5_TEST_PASSWORD, ARQ5_TEST_BUCKET to run");
                 return;
             }
         };

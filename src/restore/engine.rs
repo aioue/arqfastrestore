@@ -334,17 +334,13 @@ impl RestoreEngine {
                 .par_chunks(pack_concurrency)
                 .flat_map_iter(|chunk| {
                     chunk.iter().flat_map(|group| {
-                        let pack_num = pack_idx_ref
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                            + 1;
+                        let pack_num =
+                            pack_idx_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                         pb_ref.set_message(format!("{pack_num}/{total_packs}"));
                         group.iter().map(move |item| {
                             let stat = process_item(item, bw, dry_run);
                             pb_ref.inc(1);
-                            bytes_ref.fetch_add(
-                                stat.bytes,
-                                std::sync::atomic::Ordering::Relaxed,
-                            );
+                            bytes_ref.fetch_add(stat.bytes, std::sync::atomic::Ordering::Relaxed);
                             stat
                         })
                     })
@@ -389,7 +385,7 @@ impl RestoreEngine {
 
         if !failure_counts.is_empty() {
             let mut cats: Vec<(String, usize)> = failure_counts.into_iter().collect();
-            cats.sort_by(|a, b| b.1.cmp(&a.1));
+            cats.sort_by_key(|a| std::cmp::Reverse(a.1));
             eprintln!("--- failure categories ({files_failed} total failures) ---");
             for (cat, count) in cats.iter().take(20) {
                 eprintln!("  {count:>6}x  {cat}");
@@ -876,7 +872,8 @@ mod tests {
         let reader = BlobReader::new(Arc::new(storage), None);
 
         let mut node = file_node("blobs/first", 10);
-        node.data_blob_locs.push(simple_blob_loc("blobs/missing", 5));
+        node.data_blob_locs
+            .push(simple_blob_loc("blobs/missing", 5));
         let item = RestoreItem {
             dest_path: dest.clone(),
             node,

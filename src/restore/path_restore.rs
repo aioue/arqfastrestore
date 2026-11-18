@@ -71,7 +71,12 @@ pub fn collect_path_items(
                 .map(|(n, _)| n.as_str())
                 .collect();
             names.sort_unstable();
-            let shown = names.iter().take(40).copied().collect::<Vec<_>>().join(", ");
+            let shown = names
+                .iter()
+                .take(40)
+                .copied()
+                .collect::<Vec<_>>()
+                .join(", ");
             bail!(
                 "'{comp}' not found under '/{walked}' ({} entries: {shown}{})",
                 names.len(),
@@ -79,7 +84,11 @@ pub fn collect_path_items(
             );
         };
         dest = dest.join(&name);
-        walked = if walked.is_empty() { name } else { format!("{walked}/{name}") };
+        walked = if walked.is_empty() {
+            name
+        } else {
+            format!("{walked}/{name}")
+        };
 
         if i + 1 == comps.len() {
             if node.is_tree {
@@ -152,18 +161,28 @@ mod tests {
     }
 
     fn dir(path: &str) -> Node {
-        Node { is_tree: true, tree_blob_loc: Some(loc(path)), ..Default::default() }
+        Node {
+            is_tree: true,
+            tree_blob_loc: Some(loc(path)),
+            ..Default::default()
+        }
     }
 
     fn file(size: u64) -> Node {
-        Node { item_size: size, ..Default::default() }
+        Node {
+            item_size: size,
+            ..Default::default()
+        }
     }
 
     fn parse() -> TreeParseFn {
         Arc::new(|bytes: &[u8]| {
             let nodes = match bytes {
                 b"root" => vec![("a".to_owned(), dir("a")), ("f.txt".to_owned(), file(1))],
-                b"a" => vec![("b.json".to_owned(), file(2)), ("sub".to_owned(), dir("sub"))],
+                b"a" => vec![
+                    ("b.json".to_owned(), file(2)),
+                    ("sub".to_owned(), dir("sub")),
+                ],
                 b"sub" => vec![("c".to_owned(), file(3))],
                 _ => bail!("unknown tree"),
             };
@@ -195,7 +214,10 @@ mod tests {
     #[test]
     fn folder_returns_dir_and_descendants() {
         let items = run("/a/").unwrap();
-        let mut paths: Vec<_> = items.iter().map(|i| i.dest_path.to_string_lossy().into_owned()).collect();
+        let mut paths: Vec<_> = items
+            .iter()
+            .map(|i| i.dest_path.to_string_lossy().into_owned())
+            .collect();
         paths.sort();
         assert_eq!(paths, ["/d/a", "/d/a/b.json", "/d/a/sub", "/d/a/sub/c"]);
     }
@@ -209,7 +231,12 @@ mod tests {
 
     #[test]
     fn file_in_middle_and_dotdot_rejected() {
-        assert!(run("f.txt/x").unwrap_err().to_string().contains("is a file"));
+        assert!(
+            run("f.txt/x")
+                .unwrap_err()
+                .to_string()
+                .contains("is a file")
+        );
         assert!(split_rel_path("a/../b").is_err());
         assert!(split_rel_path("//").is_err());
     }

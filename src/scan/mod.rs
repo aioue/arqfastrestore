@@ -250,7 +250,10 @@ pub fn run_scan<W: Write>(
             let root_loc = match &record.root_tree_blob_loc {
                 Some(loc) => loc.clone(),
                 None => {
-                    warn!("skipping snapshot ts={}: no root_tree_blob_loc", record.timestamp);
+                    warn!(
+                        "skipping snapshot ts={}: no root_tree_blob_loc",
+                        record.timestamp
+                    );
                     continue;
                 }
             };
@@ -293,7 +296,10 @@ pub fn run_scan<W: Write>(
             );
 
             if let Err(e) = collect_result {
-                warn!("scan: error walking snapshot ts={}: {e:#}", record.timestamp);
+                warn!(
+                    "scan: error walking snapshot ts={}: {e:#}",
+                    record.timestamp
+                );
             }
 
             // Flush pending tree cache writes in a single transaction.
@@ -320,11 +326,7 @@ pub fn run_scan<W: Write>(
     let mut rows: Vec<ScanRow> = dedup
         .into_iter()
         .map(|((path, sha), a)| {
-            let mut uuid_strs: Vec<&str> = a
-                .uuid_idxs
-                .iter()
-                .map(|&idx| pool.get(idx))
-                .collect();
+            let mut uuid_strs: Vec<&str> = a.uuid_idxs.iter().map(|&idx| pool.get(idx)).collect();
             uuid_strs.sort();
             ScanRow {
                 source_root: pool.get(a.source_root_idx).to_owned(),
@@ -424,8 +426,8 @@ fn collect_into_map(
         let tree_bytes = blob_reader
             .read_blob(tree_loc)
             .with_context(|| format!("reading tree blob {tree_id}"))?;
-        let parsed = (parse_tree)(&tree_bytes)
-            .with_context(|| format!("parsing tree blob {tree_id}"))?;
+        let parsed =
+            (parse_tree)(&tree_bytes).with_context(|| format!("parsing tree blob {tree_id}"))?;
         // Mark as visited only after successful read+parse so that a failed
         // attempt does not permanently block future snapshots with the same id.
         visited_trees.insert(tree_id.clone());
@@ -455,23 +457,23 @@ fn collect_into_map(
         if node.is_tree {
             // Recurse into subdirectory.
             if let Some(ref subtree_loc) = node.tree_blob_loc
-                    && let Err(e) = collect_into_map(
-                        blob_reader,
-                        subtree_loc,
-                        &item_path,
-                        parse_tree,
-                        tree_cache,
-                        backup_uuid,
-                        source_root,
-                        computer_name,
-                        backup_name,
-                        snapshot_ts,
-                        filter,
-                        map,
-                        pool,
-                        pending_cache_bytes,
-                        visited_trees,
-                    )
+                && let Err(e) = collect_into_map(
+                    blob_reader,
+                    subtree_loc,
+                    &item_path,
+                    parse_tree,
+                    tree_cache,
+                    backup_uuid,
+                    source_root,
+                    computer_name,
+                    backup_name,
+                    snapshot_ts,
+                    filter,
+                    map,
+                    pool,
+                    pending_cache_bytes,
+                    visited_trees,
+                )
             {
                 warn!("scan: error walking subtree '{item_path}': {e:#}");
             }
@@ -570,8 +572,7 @@ fn glob_match_chars(p: &[char], t: &[char]) -> bool {
         (None, None) => true,
         (Some(&'*'), _) => {
             // `*` can match zero or more characters.
-            glob_match_chars(&p[1..], t)
-                || (!t.is_empty() && glob_match_chars(p, &t[1..]))
+            glob_match_chars(&p[1..], t) || (!t.is_empty() && glob_match_chars(p, &t[1..]))
         }
         (Some(&'?'), Some(_)) => glob_match_chars(&p[1..], &t[1..]),
         (Some(pc), Some(tc)) => {
@@ -624,7 +625,11 @@ fn format_ts(sec: i64) -> String {
     }
     // Manual UTC formatting without an extra dependency.
     use std::time::{Duration, UNIX_EPOCH};
-    let secs = if sec >= 0 { sec as u64 } else { return sec.to_string() };
+    let secs = if sec >= 0 {
+        sec as u64
+    } else {
+        return sec.to_string();
+    };
     // Sanity check: compute a SystemTime just to avoid blatant overflow;
     // we don't actually use it.
     if UNIX_EPOCH.checked_add(Duration::from_secs(secs)).is_none() {
@@ -733,8 +738,12 @@ mod tests {
                 snapshot_count: 0,
             });
             entry.snapshot_count += 1;
-            if ts < entry.first_seen { entry.first_seen = ts; }
-            if ts > entry.last_seen  { entry.last_seen  = ts; }
+            if ts < entry.first_seen {
+                entry.first_seen = ts;
+            }
+            if ts > entry.last_seen {
+                entry.last_seen = ts;
+            }
             if !entry.uuid_idxs.contains(&uuid_idx) {
                 entry.uuid_idxs.push(uuid_idx);
             }
@@ -845,7 +854,10 @@ mod tests {
     #[test]
     fn primary_blob_sha_empty_returns_none() {
         use crate::format::arq7::Node;
-        let node = Node { data_blob_locs: vec![], ..Default::default() };
+        let node = Node {
+            data_blob_locs: vec![],
+            ..Default::default()
+        };
         assert!(primary_blob_sha(&node).is_none());
     }
 

@@ -28,7 +28,10 @@ use crypto::{Arq5Keys, Arq7Keys, decrypt_arq5_object, decrypt_arq7_object};
 /// - `password` provided → return it as-is
 /// - `password_file` provided → read the file, split by newlines, trim each
 ///   line, filter empty lines, join with `","`. Errors if the result is empty.
-fn resolve_password(password: Option<String>, password_file: Option<String>) -> anyhow::Result<String> {
+fn resolve_password(
+    password: Option<String>,
+    password_file: Option<String>,
+) -> anyhow::Result<String> {
     match (password, password_file) {
         (Some(_), Some(_)) => bail!("cannot specify both --password and --password-file"),
         (None, None) => bail!("one of --password or --password-file is required"),
@@ -50,9 +53,12 @@ fn resolve_password(password: Option<String>, password_file: Option<String>) -> 
     }
 }
 use format::arq5_adapter::{arq5_tree_to_tree, blob_key_to_blob_loc, strip_encrypted_prefix};
-use format::{Arq5Commit, Arq5Tree, BackupRecord, PackIndexDb, list_all_backup_folders, read_arq5_computer_info, read_backup_config};
-use restore::{RestoreEngine, RestoreStats, TreeCache, TreeParseFn};
+use format::{
+    Arq5Commit, Arq5Tree, BackupRecord, PackIndexDb, list_all_backup_folders,
+    read_arq5_computer_info, read_backup_config,
+};
 use restore::csv_restore::{UuidContext, items_from_csv};
+use restore::{RestoreEngine, RestoreStats, TreeCache, TreeParseFn};
 use storage::{DecryptFn, LocalStorage};
 
 #[derive(Parser)]
@@ -465,9 +471,11 @@ fn main() -> Result<()> {
                                     }
                                     if let Some(ref root) = storage_override {
                                         for (folder_uuid, _, _) in &folders {
-                                            storage_root_map.insert(folder_uuid.clone(), root.clone());
+                                            storage_root_map
+                                                .insert(folder_uuid.clone(), root.clone());
                                             // Arq5: each folder uses same parse_tree (bucket-aware closure).
-                                            parse_tree_map.insert(folder_uuid.clone(), parse_tree.clone());
+                                            parse_tree_map
+                                                .insert(folder_uuid.clone(), parse_tree.clone());
                                         }
                                     }
                                     all_folders.extend(folders);
@@ -483,7 +491,9 @@ fn main() -> Result<()> {
                     }
                 }
                 if !found {
-                    eprintln!("scan: skipping {uuid_name} (no matching password or unsupported format)");
+                    eprintln!(
+                        "scan: skipping {uuid_name} (no matching password or unsupported format)"
+                    );
                 }
             }
 
@@ -492,8 +502,8 @@ fn main() -> Result<()> {
                 return Ok(());
             }
 
-            let parse_tree = scan_parse_tree
-                .context("no parse_tree function — all UUID dirs failed to open")?;
+            let parse_tree =
+                scan_parse_tree.context("no parse_tree function — all UUID dirs failed to open")?;
 
             let config = scan::ScanConfig {
                 storage_root,
@@ -503,8 +513,7 @@ fn main() -> Result<()> {
                 parse_tree_map,
                 filter,
                 files_only: true,
-                tree_cache: open_tree_cache(false, None, false)?
-                    .map(std::sync::Arc::new),
+                tree_cache: open_tree_cache(false, None, false)?.map(std::sync::Arc::new),
             };
 
             let stdout = std::io::stdout();
@@ -548,7 +557,14 @@ fn main() -> Result<()> {
             match fmt {
                 BackupFormat::Arq5(keys) => {
                     restore_arq5(
-                        &bp, keys, &dest, timestamp, dry_run, verbose, cache_path, no_cache,
+                        &bp,
+                        keys,
+                        &dest,
+                        timestamp,
+                        dry_run,
+                        verbose,
+                        cache_path,
+                        no_cache,
                         pack_concurrency,
                     )?;
                 }
@@ -602,7 +618,9 @@ fn main() -> Result<()> {
             }
             let plan_dir = PathBuf::from(&backup_path);
             let BackupFormat::Arq7(keys) = detect_format(&plan_dir, &password)? else {
-                bail!("verify supports encrypted Arq 7 plan directories only (no encryptedkeyset.dat found)");
+                bail!(
+                    "verify supports encrypted Arq 7 plan directories only (no encryptedkeyset.dat found)"
+                );
             };
             let storage_root = plan_dir
                 .parent()
@@ -647,7 +665,16 @@ fn main() -> Result<()> {
                 BackupFormat::Unencrypted => None,
                 BackupFormat::Arq5(_) => bail!("restore-path supports Arq7 backups only"),
             };
-            restore_path_arq7(&backup_path, keys, &record, &path, &dest, dry_run, cache_path, no_cache)
+            restore_path_arq7(
+                &backup_path,
+                keys,
+                &record,
+                &path,
+                &dest,
+                dry_run,
+                cache_path,
+                no_cache,
+            )
         }
         Commands::RestoreFromCsv {
             csv,
@@ -941,7 +968,10 @@ fn build_uuid_contexts(
             }
 
             if contexts.is_empty() {
-                bail!("no unencrypted backup folders found in {}", uuid_dir.display());
+                bail!(
+                    "no unencrypted backup folders found in {}",
+                    uuid_dir.display()
+                );
             }
 
             Ok(contexts)
@@ -1318,7 +1348,10 @@ fn list_arq5_buckets(
             timestamp: commit.creation_date_ms.unwrap_or(0) / 1000,
             root_tree_blob_loc: root_blob_loc,
             local_path: local_path.clone(),
-            arq_version: commit.arq_version.clone().unwrap_or_else(|| "arq5".to_owned()),
+            arq_version: commit
+                .arq_version
+                .clone()
+                .unwrap_or_else(|| "arq5".to_owned()),
             is_complete: commit.is_complete,
         };
 
@@ -1398,9 +1431,7 @@ fn walk_arq5_commit_chain(
         ) {
             Ok(d) => d,
             Err(e) => {
-                tracing::warn!(
-                    "bucket {bucket_uuid}: stopping chain walk at {parent_sha1}: {e:#}"
-                );
+                tracing::warn!("bucket {bucket_uuid}: stopping chain walk at {parent_sha1}: {e:#}");
                 break;
             }
         };
@@ -1814,16 +1845,12 @@ type ScanContext = (
     Option<DecryptFn>,
     TreeParseFn,
     std::collections::HashMap<String, (String, String)>,
-    Option<PathBuf>,  // per-UUID storage root override (Arq5)
+    Option<PathBuf>, // per-UUID storage root override (Arq5)
 );
 
 /// Build the folder list, decrypt function, tree-parse function, and plan
 /// metadata map needed for a scan run.
-fn build_scan_context(
-    bp: &Path,
-    backup_path: &str,
-    fmt: BackupFormat,
-) -> Result<ScanContext> {
+fn build_scan_context(bp: &Path, backup_path: &str, fmt: BackupFormat) -> Result<ScanContext> {
     // Plan UUID is the directory name of backup_path.
     let plan_uuid = bp
         .file_name()
@@ -1839,7 +1866,10 @@ fn build_scan_context(
             let (computer_name, backup_name) = read_backup_config(&storage, "");
             let mut plan_meta = std::collections::HashMap::new();
             for (folder_uuid, _, _) in &folders {
-                plan_meta.insert(folder_uuid.clone(), (computer_name.clone(), backup_name.clone()));
+                plan_meta.insert(
+                    folder_uuid.clone(),
+                    (computer_name.clone(), backup_name.clone()),
+                );
             }
             // Also store under plan_uuid itself for lookup convenience.
             plan_meta.insert(plan_uuid, (computer_name, backup_name));
@@ -1856,7 +1886,10 @@ fn build_scan_context(
             let (computer_name, backup_name) = read_backup_config(&storage, "");
             let mut plan_meta = std::collections::HashMap::new();
             for (folder_uuid, _, _) in &folders {
-                plan_meta.insert(folder_uuid.clone(), (computer_name.clone(), backup_name.clone()));
+                plan_meta.insert(
+                    folder_uuid.clone(),
+                    (computer_name.clone(), backup_name.clone()),
+                );
             }
             plan_meta.insert(plan_uuid, (computer_name, backup_name));
             use crate::format::arq7::Tree;
@@ -1871,12 +1904,20 @@ fn build_scan_context(
             }
 
             // For Arq5, read computer name from the `computerinfo` plist in the plan root.
-            let (computer_name, _user_name) = read_arq5_computer_info(&LocalStorage::new(backup_path));
-            let computer_name = if computer_name.is_empty() { plan_uuid.clone() } else { computer_name };
+            let (computer_name, _user_name) =
+                read_arq5_computer_info(&LocalStorage::new(backup_path));
+            let computer_name = if computer_name.is_empty() {
+                plan_uuid.clone()
+            } else {
+                computer_name
+            };
             let backup_name = String::from("Arq5 backup");
             let mut plan_meta = std::collections::HashMap::new();
             for (folder_uuid, _, _) in &folders {
-                plan_meta.insert(folder_uuid.clone(), (computer_name.clone(), backup_name.clone()));
+                plan_meta.insert(
+                    folder_uuid.clone(),
+                    (computer_name.clone(), backup_name.clone()),
+                );
             }
             plan_meta.insert(plan_uuid.clone(), (computer_name, backup_name));
 
@@ -1924,11 +1965,7 @@ fn build_scan_context(
                     all_blob_dbs.iter().zip(all_tree_dbs.iter())
                 {
                     match format::arq5_adapter::arq5_tree_to_tree(
-                        &arq5_tree,
-                        blob_db,
-                        blob_dir,
-                        tree_db,
-                        tree_dir,
+                        &arq5_tree, blob_db, blob_dir, tree_db, tree_dir,
                     ) {
                         Ok(tree) => return Ok(tree),
                         Err(e) => last_err = e,
@@ -1939,7 +1976,13 @@ fn build_scan_context(
 
             // Arq5 storage root is the UUID dir itself (BlobLoc paths are relative to it).
             let storage_root_override = Some(bp.to_path_buf());
-            Ok((folders, decrypt, parse_tree, plan_meta, storage_root_override))
+            Ok((
+                folders,
+                decrypt,
+                parse_tree,
+                plan_meta,
+                storage_root_override,
+            ))
         }
     }
 }
@@ -2015,18 +2058,38 @@ fn format_rfc3339(ts: u64) -> String {
     let days = (ts / 86400) as i64;
     let rem = ts % 86400;
     let (y, m, d) = civil_from_days(days);
-    format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z", rem / 3600, rem % 3600 / 60, rem % 60)
+    format!(
+        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
+        rem / 3600,
+        rem % 3600 / 60,
+        rem % 60
+    )
 }
 
 /// Parse `YYYY-MM-DDTHH:MM:SS[.frac](Z|+HH:MM|-HH:MM)` to Unix seconds.
 fn parse_rfc3339(s: &str) -> Result<u64> {
     let err = || anyhow::anyhow!("invalid RFC 3339 time '{s}' (want e.g. 2026-11-01T12:50:00Z)");
     let b = s.as_bytes();
-    if b.len() < 20 || b[4] != b'-' || b[7] != b'-' || !(b[10] == b'T' || b[10] == b't' || b[10] == b' ') || b[13] != b':' || b[16] != b':' {
+    if b.len() < 20
+        || b[4] != b'-'
+        || b[7] != b'-'
+        || !(b[10] == b'T' || b[10] == b't' || b[10] == b' ')
+        || b[13] != b':'
+        || b[16] != b':'
+    {
         return Err(err());
     }
-    let num = |a: usize, z: usize| -> Result<i64> { s.get(a..z).and_then(|t| t.parse().ok()).ok_or_else(err) };
-    let (y, mo, d, h, mi, sec) = (num(0, 4)?, num(5, 7)?, num(8, 10)?, num(11, 13)?, num(14, 16)?, num(17, 19)?);
+    let num = |a: usize, z: usize| -> Result<i64> {
+        s.get(a..z).and_then(|t| t.parse().ok()).ok_or_else(err)
+    };
+    let (y, mo, d, h, mi, sec) = (
+        num(0, 4)?,
+        num(5, 7)?,
+        num(8, 10)?,
+        num(11, 13)?,
+        num(14, 16)?,
+        num(17, 19)?,
+    );
     if !(1..=12).contains(&mo) || !(1..=31).contains(&d) || h > 23 || mi > 59 || sec > 60 {
         return Err(err());
     }
@@ -2074,7 +2137,10 @@ fn restore_path_arq7(
         record.local_path,
         record.is_complete
     );
-    let root_loc = record.root_tree_blob_loc.as_ref().context("record has no root tree")?;
+    let root_loc = record
+        .root_tree_blob_loc
+        .as_ref()
+        .context("record has no root tree")?;
 
     // Same layout rule as restore_arq7: blob relativePaths include the plan UUID dir.
     let blob_storage_root = PathBuf::from(backup_path)
@@ -2107,7 +2173,16 @@ fn restore_path_arq7(
         );
     }
 
-    let engine = RestoreEngine::new(storage_arc, decrypt, PathBuf::from(dest), dry_run, false, cache, parse_tree, 1);
+    let engine = RestoreEngine::new(
+        storage_arc,
+        decrypt,
+        PathBuf::from(dest),
+        dry_run,
+        false,
+        cache,
+        parse_tree,
+        1,
+    );
     let stats = engine.restore_items(items)?;
     print_restore_stats(&stats, dry_run);
     if stats.files_failed > 0 {
@@ -2154,7 +2229,10 @@ mod tests {
         assert_eq!(parse_rfc3339("1970-01-01T00:00:00Z").unwrap(), 0);
         assert_eq!(parse_rfc3339("2026-11-01T12:50:00Z").unwrap(), 1793537400);
         assert_eq!(format_rfc3339(1793537400), "2026-11-01T12:50:00Z");
-        assert_eq!(parse_rfc3339("2026-11-01T13:50:00.5+01:00").unwrap(), 1793537400);
+        assert_eq!(
+            parse_rfc3339("2026-11-01T13:50:00.5+01:00").unwrap(),
+            1793537400
+        );
         assert_eq!(format_rfc3339(951782400), "2000-02-29T00:00:00Z");
         assert!(parse_rfc3339("2026-13-01T00:00:00Z").is_err());
         assert!(parse_rfc3339("yesterday").is_err());
@@ -2162,15 +2240,28 @@ mod tests {
 
     #[test]
     fn record_selectors() {
-        let folders = vec![("u".to_owned(), "/x".to_owned(), vec![make_record(100), make_record(200), make_record(300)])];
+        let folders = vec![(
+            "u".to_owned(),
+            "/x".to_owned(),
+            vec![make_record(100), make_record(200), make_record(300)],
+        )];
         let mut folders = folders;
         for r in &mut folders[0].2 {
             r.root_tree_blob_loc = Some(crate::format::arq7::BlobLoc {
-                identifier: "x".into(), is_packed: false, is_large_pack: false, relative_path: None,
-                offset: 0, length: 0, stretch_encryption_key: false, compression_type: 0, is_arq5_pack_entry: false,
+                identifier: "x".into(),
+                is_packed: false,
+                is_large_pack: false,
+                relative_path: None,
+                offset: 0,
+                length: 0,
+                stretch_encryption_key: false,
+                compression_type: 0,
+                is_arq5_pack_entry: false,
             });
         }
-        let pick = |s: &str| select_record_by(&folders, &parse_record_selector(s).unwrap()).map(|r| r.timestamp);
+        let pick = |s: &str| {
+            select_record_by(&folders, &parse_record_selector(s).unwrap()).map(|r| r.timestamp)
+        };
         assert_eq!(pick("latest"), Some(300));
         assert_eq!(pick("200"), Some(200));
         assert_eq!(pick("before:1970-01-01T00:04:20Z"), Some(200));

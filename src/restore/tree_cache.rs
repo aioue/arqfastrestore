@@ -94,7 +94,10 @@ impl TreeCache {
             return;
         }
         if let Err(e) = self.put_batch_inner(entries) {
-            warn!("tree cache batch write failed ({} entries): {e:#}", entries.len());
+            warn!(
+                "tree cache batch write failed ({} entries): {e:#}",
+                entries.len()
+            );
         }
         self.misses.fetch_add(entries.len(), Ordering::Relaxed);
     }
@@ -114,7 +117,8 @@ impl TreeCache {
                     .with_context(|| format!("inserting tree {tree_id} into cache"))?;
             }
         }
-        txn.commit().context("committing cache batch write transaction")?;
+        txn.commit()
+            .context("committing cache batch write transaction")?;
         Ok(())
     }
 
@@ -149,7 +153,8 @@ impl TreeCache {
                     .with_context(|| format!("inserting tree {tree_id} into cache"))?;
             }
         }
-        txn.commit().context("committing cache raw batch write transaction")?;
+        txn.commit()
+            .context("committing cache raw batch write transaction")?;
         Ok(())
     }
 
