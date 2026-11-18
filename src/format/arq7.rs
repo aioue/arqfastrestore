@@ -193,7 +193,9 @@ impl Node {
         // real repositories (it decodes every sampled tree to its last byte):
         //   [Int64 sec][Int64 nsec]               timestamp pair
         //   [UInt32 ?][Bool a][Bool b]
-        //   [UInt64 x2] if a, [UInt64 x2] if b    (sizes; 4 MiB chunk info for big files)
+        //   [UInt64 x2]                           always
+        //   [UInt64 x2]                           only if b (4 MiB chunk info for big files)
+        // `a` does not change the length. Verified on ~3M trees from a real repository.
         // A wrong guess still fails loudly: the next node's name would not parse.
         if tree_version >= 4 {
             if !has_reparse {
@@ -203,7 +205,8 @@ impl Node {
             r.read_u32_be().context("Node v4 reserved")?;
             let a = r.read_bool().context("Node v4 flag a")?;
             let b = r.read_bool().context("Node v4 flag b")?;
-            let pairs = usize::from(a) + usize::from(b);
+            let _ = a;
+            let pairs = 1 + usize::from(b);
             r.skip(16 * pairs).context("Node v4 size fields")?;
         }
 
@@ -399,9 +402,9 @@ mod tests {
             out.extend_from_slice(&9i64.to_be_bytes());
             out.extend_from_slice(&10i64.to_be_bytes());
             out.extend_from_slice(&0u32.to_be_bytes());
-            out.push(1); // flag a
+            out.push(u8::from(!name.starts_with("noflag"))); // flag a
             out.push(u8::from(big)); // flag b
-            out.extend_from_slice(&[0u8; 16]); // pair for a
+            out.extend_from_slice(&[0u8; 16]); // always-present pair
             if big {
                 out.extend_from_slice(&4_194_304u64.to_be_bytes()); // pair for b
                 out.extend_from_slice(&1u64.to_be_bytes());
@@ -431,11 +434,11 @@ mod tests {
 
     #[test]
     fn parses_tree_version_4_node_tail() {
-        let t = Tree::parse(&build_tree(4, &["a", "big1", "c"])).unwrap();
+        let t = Tree::parse(&build_tree(4, &["a", "big1", "noflag", "c"])).unwrap();
         assert_eq!(t.version, 4);
         let names: Vec<_> = t.nodes.iter().map(|(n, _)| n.as_str()).collect();
-        assert_eq!(names, ["a", "big1", "c"]);
-        assert_eq!(t.nodes[2].1.mac_st_uid, 501);
+        assert_eq!(names, ["a", "big1", "noflag", "c"]);
+        assert_eq!(t.nodes[3].1.mac_st_uid, 501);
         assert_eq!(t.nodes[0].1.win_reparse_tag, Some(0));
     }
 
