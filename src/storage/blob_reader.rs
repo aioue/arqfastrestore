@@ -136,6 +136,14 @@ const PACK_CACHE_BUDGET_BYTES: u64 = 512 * 1024 * 1024;
 /// pack file independently.
 type PackSlot = Arc<OnceLock<Vec<u8>>>;
 
+/// A cache entry. `counted` is true once the slot's bytes have been added to
+/// `pack_cache_bytes`; it is read and written only under the cache write lock,
+/// so a slot evicted while it was still loading is never counted.
+struct CacheEntry {
+    slot: PackSlot,
+    counted: bool,
+}
+
 /// Resolves [`BlobLoc`] references to their final, usable byte content.
 ///
 /// Includes an in-memory cache for pack files to avoid redundant storage
@@ -146,7 +154,7 @@ pub struct BlobReader {
     storage: Arc<dyn Storage>,
     decrypt: Option<DecryptFn>,
     /// Cache: pack-file path → slot.
-    pack_cache: RwLock<HashMap<String, PackSlot>>,
+    pack_cache: RwLock<HashMap<String, CacheEntry>>,
     /// Current total bytes held in the cache (populated slots only).
     pack_cache_bytes: std::sync::atomic::AtomicU64,
     /// Maximum bytes to hold in the cache (0 = disabled).
@@ -369,83 +377,122 @@ impl BlobReader {
             return Self::extract_slice(&pack, loc);
         }
 
-        // --- Step 1: get-or-insert a slot with only a read lock held ---
-        let slot: PackSlot = {
+        let slot = self.claim_slot(path);
+        match self.load_slot(path, &slot)? {
+            Some(pack) => Self::extract_slice(pack, loc),
+            None => {
+                // Another thread's read of this pack failed and was not cached:
+                // read it ourselves (a transient error must not fail every blob).
+                let pack = self
+                    .storage
+                    .read(path)
+                    .with_context(|| format!("reading pack file {}", path))?;
+                Self::extract_slice(&pack, loc)
+            }
+        }
+    }
+
+    /// Return the cache slot for `path`, inserting an empty one (after evicting
+    /// entries to stay within the byte budget) when there is none.
+    fn claim_slot(&self, path: &str) -> PackSlot {
+        {
+            let cache = self.pack_cache.read().unwrap();
+            if let Some(e) = cache.get(path)
+                && e.slot.get().is_some()
             {
-                let cache = self.pack_cache.read().unwrap();
-                if let Some(s) = cache.get(path) {
-                    s.clone()
-                } else {
-                    Arc::new(OnceLock::new()) // placeholder — may be replaced below
-                }
+                self.stats.cache_hits.fetch_add(1, Ordering::Relaxed);
+                return e.slot.clone();
             }
-        };
-
-        // Re-check under write lock only if we got a placeholder.
-        let slot = if slot.get().is_some() {
-            self.stats.cache_hits.fetch_add(1, Ordering::Relaxed);
-            slot
-        } else {
-            let mut cache = self.pack_cache.write().unwrap();
-            if let Some(existing) = cache.get(path) {
-                let s = existing.clone();
-                drop(cache);
-                if s.get().is_some() {
-                    self.stats.cache_hits.fetch_add(1, Ordering::Relaxed);
-                }
-                s
-            } else {
-                // Evict entries until we're under the byte budget.
-                // We evict based on current tracked bytes; the new entry's size
-                // is unknown until after get_or_init, so we evict conservatively.
-                while self.pack_cache_bytes.load(Ordering::Relaxed) >= self.max_cache_bytes
-                    && !cache.is_empty()
-                {
-                    if let Some(key) = cache.keys().next().cloned()
-                        && let Some(slot) = cache.remove(&key)
-                        && let Some(data) = slot.get()
-                    {
-                        self.pack_cache_bytes
-                            .fetch_sub(data.len() as u64, Ordering::Relaxed);
-                    }
-                }
-                let new_slot: PackSlot = Arc::new(OnceLock::new());
-                cache.insert(path.to_string(), new_slot.clone());
-                drop(cache);
-                self.stats.cache_misses.fetch_add(1, Ordering::Relaxed);
-                new_slot
+        }
+        let mut cache = self.pack_cache.write().unwrap();
+        if let Some(e) = cache.get(path) {
+            if e.slot.get().is_some() {
+                self.stats.cache_hits.fetch_add(1, Ordering::Relaxed);
             }
-        };
+            return e.slot.clone();
+        }
+        // Evict entries until we're under the byte budget. The new entry's size
+        // is unknown until it is loaded, so we evict conservatively.
+        while self.pack_cache_bytes.load(Ordering::Relaxed) >= self.max_cache_bytes
+            && !cache.is_empty()
+        {
+            if let Some(key) = cache.keys().next().cloned() {
+                self.evict(&mut cache, &key);
+            }
+        }
+        let new_slot: PackSlot = Arc::new(OnceLock::new());
+        cache.insert(
+            path.to_string(),
+            CacheEntry {
+                slot: new_slot.clone(),
+                counted: false,
+            },
+        );
+        self.stats.cache_misses.fetch_add(1, Ordering::Relaxed);
+        new_slot
+    }
 
-        // --- Step 2: populate the slot (exactly one thread does the I/O) ---
+    /// Remove `key` from the cache, releasing its bytes if they were counted.
+    fn evict(&self, cache: &mut HashMap<String, CacheEntry>, key: &str) {
+        if let Some(e) = cache.remove(key)
+            && e.counted
+            && let Some(data) = e.slot.get()
+        {
+            self.pack_cache_bytes
+                .fetch_sub(data.len() as u64, Ordering::Relaxed);
+        }
+    }
+
+    /// Populate `slot` (exactly one thread does the I/O; others wait).
+    ///
+    /// Returns `Ok(None)` when another thread's read of this pack failed: failed
+    /// reads are never cached, the caller reads the pack itself. When this
+    /// thread's own read fails, the slot is dropped from the cache and the error
+    /// is returned.
+    fn load_slot<'s>(&self, path: &str, slot: &'s PackSlot) -> Result<Option<&'s Vec<u8>>> {
+        let mut read_error: Option<anyhow::Error> = None;
+        let mut loaded_here = false;
         let pack: &Vec<u8> = slot.get_or_init(|| {
+            loaded_here = true;
             let t0 = Instant::now();
-            let data = self.storage.read(path).unwrap_or_else(|_| Vec::new());
-            let elapsed = t0.elapsed().as_nanos() as u64;
+            let data = match self.storage.read(path) {
+                Ok(d) => d,
+                Err(e) => {
+                    read_error = Some(e);
+                    Vec::new()
+                }
+            };
             self.stats
                 .storage_read_nanos
-                .fetch_add(elapsed, Ordering::Relaxed);
+                .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
             self.stats
                 .bytes_from_storage
                 .fetch_add(data.len() as u64, Ordering::Relaxed);
-            self.pack_cache_bytes
-                .fetch_add(data.len() as u64, Ordering::Relaxed);
-
-            // Track per-pack storage read count.
             if let Ok(mut map) = self.stats.pack_storage_reads.write() {
                 *map.entry(path.to_string()).or_insert(0) += 1;
             }
-
             data
         });
 
-        if pack.is_empty() {
-            self.storage
-                .read(path)
-                .with_context(|| format!("reading pack file {}", path))?;
+        if loaded_here {
+            // Count the bytes only while the slot is still in the cache; it may
+            // have been evicted by another thread while it was loading.
+            let mut cache = self.pack_cache.write().unwrap();
+            let ours = cache.get(path).is_some_and(|e| Arc::ptr_eq(&e.slot, slot));
+            if ours {
+                if read_error.is_some() || pack.is_empty() {
+                    cache.remove(path);
+                } else if let Some(e) = cache.get_mut(path) {
+                    e.counted = true;
+                    self.pack_cache_bytes
+                        .fetch_add(pack.len() as u64, Ordering::Relaxed);
+                }
+            }
         }
-
-        Self::extract_slice(pack, loc)
+        if let Some(e) = read_error {
+            return Err(e).with_context(|| format!("reading pack file {}", path));
+        }
+        Ok(if pack.is_empty() { None } else { Some(pack) })
     }
 
     /// Extract the raw object data from an Arq5 pack entry at the given offset.
@@ -726,6 +773,104 @@ mod tests {
         let loc = make_loc("blobpacks/small.pack", true, 5, 20, 0); // 5+20 = 25 > 10
 
         assert!(reader.read_blob(&loc).is_err());
+    }
+
+    // -------------------------------------------------------------------------
+    // Pack cache: failed reads and byte accounting
+    // -------------------------------------------------------------------------
+
+    /// Storage whose first `fail_first` reads fail, then serves `inner`.
+    struct FlakyStorage {
+        inner: MockStorage,
+        fail_first: AtomicUsize,
+        reads: AtomicUsize,
+    }
+
+    impl Storage for FlakyStorage {
+        fn read(&self, path: &str) -> Result<Vec<u8>> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            let left = self.fail_first.load(Ordering::Relaxed);
+            if left > 0 {
+                self.fail_first.store(left - 1, Ordering::Relaxed);
+                bail!("transient I/O error");
+            }
+            self.inner.read(path)
+        }
+
+        fn list(&self, _path: &str) -> Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+
+        fn exists(&self, path: &str) -> Result<bool> {
+            self.inner.exists(path)
+        }
+    }
+
+    fn cached_bytes_in_map(reader: &BlobReader) -> u64 {
+        reader
+            .pack_cache
+            .read()
+            .unwrap()
+            .values()
+            .filter(|e| e.counted)
+            .map(|e| e.slot.get().map_or(0, |d| d.len() as u64))
+            .sum()
+    }
+
+    #[test]
+    fn failed_pack_read_is_not_cached() {
+        let mut inner = MockStorage::new();
+        inner.insert("p.pack", b"0123456789".to_vec());
+        let storage = Arc::new(FlakyStorage {
+            inner,
+            fail_first: AtomicUsize::new(1),
+            reads: AtomicUsize::new(0),
+        });
+        let reader = BlobReader::new(storage.clone(), None);
+        let loc = make_loc("p.pack", true, 2, 3, 0);
+
+        let err = reader.read_blob(&loc).unwrap_err();
+        assert!(format!("{err:#}").contains("transient"), "{err:#}");
+        // The next blob from the same pack must succeed and then be cached.
+        assert_eq!(reader.read_blob(&loc).unwrap(), b"234");
+        assert_eq!(reader.read_blob(&loc).unwrap(), b"234");
+        assert_eq!(storage.reads.load(Ordering::Relaxed), 2);
+        assert_eq!(reader.pack_cache_bytes.load(Ordering::Relaxed), 10);
+    }
+
+    #[test]
+    fn slot_evicted_while_loading_is_not_counted() {
+        let mut storage = MockStorage::new();
+        storage.insert("a.pack", vec![7u8; 10]);
+        let reader = BlobReader::new(Arc::new(storage), None);
+
+        let slot = reader.claim_slot("a.pack");
+        // Another thread evicts the entry before the load finishes.
+        {
+            let mut cache = reader.pack_cache.write().unwrap();
+            reader.evict(&mut cache, "a.pack");
+        }
+        let pack = reader.load_slot("a.pack", &slot).unwrap().unwrap();
+        assert_eq!(pack.len(), 10);
+        assert_eq!(reader.pack_cache_bytes.load(Ordering::Relaxed), 0);
+        assert_eq!(cached_bytes_in_map(&reader), 0);
+    }
+
+    #[test]
+    fn cache_bytes_match_cached_slots_under_eviction() {
+        let mut storage = MockStorage::new();
+        for name in ["a", "b", "c", "d", "e"] {
+            storage.insert(format!("{name}.pack"), vec![1u8; 10]);
+        }
+        let reader = BlobReader::with_cache_bytes(Arc::new(storage), None, 25);
+        for name in ["a", "b", "c", "d", "e", "a", "c"] {
+            let loc = make_loc(&format!("{name}.pack"), true, 0, 4, 0);
+            reader.read_blob(&loc).unwrap();
+            assert_eq!(
+                reader.pack_cache_bytes.load(Ordering::Relaxed),
+                cached_bytes_in_map(&reader)
+            );
+        }
     }
 
     // -------------------------------------------------------------------------
