@@ -608,8 +608,8 @@ fn write_file_streaming<'a>(
         unique,
     ));
 
-    let mut bytes_written: u64 = 0;
-    {
+    let written = (|| -> Result<u64> {
+        let mut bytes_written: u64 = 0;
         let f = fs::File::create(&tmp_path)
             .with_context(|| format!("create temp file {:?}", tmp_path))?;
         let mut w = BufWriter::new(f);
@@ -622,11 +622,17 @@ fn write_file_streaming<'a>(
             bytes_written += chunk.len() as u64;
         }
         w.flush().with_context(|| format!("flush {:?}", tmp_path))?;
+        drop(w);
+        fs::rename(&tmp_path, dest)
+            .with_context(|| format!("rename {:?} -> {:?}", tmp_path, dest))?;
+        Ok(bytes_written)
+    })();
+
+    if written.is_err() {
+        // Do not leave a partial .arqfastrestore_tmp_* file behind.
+        let _ = fs::remove_file(&tmp_path);
     }
-
-    fs::rename(&tmp_path, dest).with_context(|| format!("rename {:?} -> {:?}", tmp_path, dest))?;
-
-    Ok(bytes_written)
+    written
 }
 
 /// Set Unix permission bits on `path` using the stored `st_mode`.
@@ -854,6 +860,33 @@ mod tests {
         assert_eq!(stats.files, 1);
         assert_eq!(stats.bytes, content.len() as u64);
         assert_eq!(stats.failed, 0);
+    }
+
+    // ------------------------------------------------------------------
+    // Test: a failed blob read leaves no temp file behind
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn process_item_failed_read_leaves_no_temp_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("broken.bin");
+
+        let mut storage = MockStorage::new();
+        storage.insert("blobs/first", b"first part".to_vec());
+        let reader = BlobReader::new(Arc::new(storage), None);
+
+        let mut node = file_node("blobs/first", 10);
+        node.data_blob_locs.push(simple_blob_loc("blobs/missing", 5));
+        let item = RestoreItem {
+            dest_path: dest.clone(),
+            node,
+        };
+        let stats = process_item(&item, &reader, false);
+
+        assert_eq!(stats.failed, 1);
+        assert!(!dest.exists());
+        let leftovers: Vec<_> = fs::read_dir(tmp.path()).unwrap().flatten().collect();
+        assert!(leftovers.is_empty(), "left behind: {leftovers:?}");
     }
 
     // ------------------------------------------------------------------
