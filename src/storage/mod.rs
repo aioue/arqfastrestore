@@ -4,7 +4,7 @@
 mod blob_reader;
 mod local;
 
-pub use blob_reader::{BlobReader, DecryptFn};
+pub use blob_reader::{BlobReader, DecryptFn, enable_identifier_verification};
 pub use local::LocalStorage;
 
 use anyhow::Result;

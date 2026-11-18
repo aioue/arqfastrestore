@@ -35,6 +35,42 @@ use crate::storage::Storage;
 /// `"encrypted"` prefix and call `decrypt_arq5_object`.
 pub type DecryptFn = Arc<dyn Fn(&[u8]) -> Result<Vec<u8>> + Send + Sync>;
 
+/// Blob-identifier salt used to verify every blob read (`restore --verify`).
+///
+/// Arq 7 identifies a blob by `sha256(salt || plaintext)` (hex). When set,
+/// [`BlobReader::read_blob`] recomputes it after decompression and fails the read
+/// on a mismatch. HMAC verification of encrypted blobs is always on; this adds
+/// an end-to-end content check. Process-wide because readers are created in
+/// several places.
+static VERIFY_SALT: OnceLock<Vec<u8>> = OnceLock::new();
+
+/// Turn on blob-identifier verification for all readers in this process.
+pub fn enable_identifier_verification(salt: Vec<u8>) {
+    let _ = VERIFY_SALT.set(salt);
+}
+
+fn check_blob_identifier(loc: &BlobLoc, plain: &[u8]) -> Result<()> {
+    use sha2::{Digest, Sha256};
+    let Some(salt) = VERIFY_SALT.get() else {
+        return Ok(());
+    };
+    // Only Arq 7 (SHA-256, 64 hex chars); Arq 5 identifiers are SHA-1.
+    if loc.identifier.len() != 64 || loc.is_arq5_pack_entry {
+        return Ok(());
+    }
+    let mut h = Sha256::new();
+    h.update(salt);
+    h.update(plain);
+    let got = hex::encode(h.finalize());
+    if !got.eq_ignore_ascii_case(&loc.identifier) {
+        bail!(
+            "blob identifier mismatch: expected {}, content hashes to {got}",
+            loc.identifier
+        );
+    }
+    Ok(())
+}
+
 /// Magic bytes that mark an ARQO-encrypted payload.
 const ARQO_MAGIC: &[u8] = b"ARQO";
 
@@ -191,6 +227,10 @@ impl BlobReader {
         } else {
             decompress_blob(&decrypted, loc.compression_type)
         };
+
+        if let Ok(ref data) = result {
+            check_blob_identifier(loc, data)?;
+        }
 
         // Track logical bytes produced (the useful output).
         if let Ok(ref data) = result {

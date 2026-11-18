@@ -13,6 +13,8 @@ Fast, parallel restore tool for [Arq](https://www.arqbackup.com/) backups. Suppo
 - **Unix permissions** — restores file modes (owner/group/other rwx + sticky/setuid/setgid)
 - **Scan command** — walks all snapshots across all backup sets, emits a deduplicated CSV for review before restoring
 - **Progress bar** — live progress with ETA during restore (suppressed automatically when not a TTY)
+- **Verify command** — read-only integrity check of an Arq 7 repository (HMAC, decrypt, decompress, blob identifier, pack ranges), with a per-file damage report
+- **Arq 7 tree version 4** — reads trees written by newer Arq 7 releases
 - **List backups** — inspect available backup records without restoring
 - **Password file** — `--password-file` reads passwords from a file (one per line) to avoid shell quoting issues with special characters
 - **jemalloc** — bounded RSS under heavy allocation workloads
@@ -65,7 +67,7 @@ same path across 300 snapshots appears as one row, not 300.
 | `path` | File path relative to the backup folder root |
 | `size_bytes` | File size |
 | `mtime` | Last-modified timestamp (UTC) |
-| `blob_sha` | SHA-256 of the file's first data blob (used to distinguish versions for `restore-from-csv`) |
+| `blob_sha` | Identifier of the file's first data blob only (used to distinguish versions for `restore-from-csv`); it is not a hash of the whole file |
 | `sources` | Semicolon-separated backup UUID(s) containing this file |
 | `first_seen` | Unix timestamp of earliest snapshot with this content |
 | `last_seen` | Unix timestamp of most recent snapshot with this content |
@@ -118,6 +120,50 @@ arqfastrestore restore \
 | `--verbose` | Print detailed timing and I/O statistics after restore |
 | `--cache-path` | Override tree cache location (default: `~/.cache/arqfastrestore/`) |
 | `--no-cache` | Disable persistent tree cache |
+
+| `--verify` | Check every blob's content against its identifier (`sha256(salt‖data)`) while restoring; Arq 7 encrypted repos only. HMAC is always checked. |
+
+### Verify a repository (read-only)
+
+```bash
+arqfastrestore verify \
+  --backup-path /path/to/<plan-uuid> \
+  --password-file ~/.arq-password \
+  --report damage.csv
+```
+
+Nothing is written to the repository and nothing is restored. For every backup
+record it walks the tree (each distinct tree once) and checks every referenced blob:
+
+1. the pack/object file exists and `offset + length` fits inside it;
+2. the ARQO HMAC-SHA256 matches (checked before decryption);
+3. it decrypts and decompresses;
+4. the plaintext hashes to the blob identifier — `sha256(salt ‖ plaintext)`, with the
+   salt from `encryptedkeyset.dat`. The formula is confirmed against the repository's
+   root trees at start-up; if it cannot be reproduced the check is skipped with a warning.
+
+Backup records are also checked: unreadable records, `isComplete = false`, and
+`errorCount` / `backupRecordErrors` are reported. Damaged blobs are classified
+(`missing_file`, `out_of_range`, `read_error`, `not_arqo`, `hmac_mismatch`,
+`decrypt_error`, `decompress_error`, `identifier_mismatch`, `tree_parse_error`) and
+flagged when zero-filled or containing long zero runs (a bad sector replaced by zeros).
+Each damaged blob is mapped back to the files and snapshots that use it, so damaged
+data can be re-backed up.
+
+| Flag | Description |
+|------|-------------|
+| `--backup-path` / `-b` | The plan directory (`<plan-uuid>`) |
+| `--password` / `--password-file` | Backup password |
+| `--threads` / `-j` | Worker threads |
+| `--latest N` | Verify only the newest N backup records (much faster) |
+| `--json` | Print the full report as JSON |
+| `--report FILE` | Write a CSV of damaged blobs and the files that use them |
+| `--max-files N` | Affected files to print in the text report (default 50) |
+| `--no-identifier-check` | Skip recomputing identifiers |
+
+Exit status: `0` clean, `2` damage found, `1` could not run. A full run reads the
+whole repository once, and keeps one in-memory entry per distinct tree and blob
+(several GB of RAM for a multi-million-file repository).
 
 ### Examples
 
@@ -238,7 +284,7 @@ The in-memory pack cache size (currently hardcoded at 512 MB) is not yet configu
 ```
 src/
   lib.rs                     — Library facade (re-exports all modules)
-  main.rs                    — CLI entry point (list + scan + restore subcommands)
+  main.rs                    — CLI entry point (list + scan + restore + verify subcommands)
   crypto/
     mod.rs                   — Re-exports Arq5Keys, Arq7Keys, decrypt_* functions
     arq5.rs                  — Arq5 key derivation (PBKDF2-SHA1) + ARQO decryption
@@ -259,6 +305,8 @@ src/
     engine.rs                — RestoreEngine (three-phase sort-by-pack parallel restore)
     tree_walker.rs           — Sequential DFS tree walker
     tree_cache.rs            — Persistent redb-backed tree cache (with batch writes)
+  verify/
+    mod.rs                   — Read-only repository verifier (records, trees, blobs, damage impact)
   scan/
     mod.rs                   — Scan engine: walk all snapshots, emit deduplicated CSV
 ```

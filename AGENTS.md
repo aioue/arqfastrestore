@@ -24,6 +24,7 @@ src/
   crypto/                    — Arq5/Arq7 decryption
   format/                    — Binary format parsers (Arq5/Arq7 blobs, trees, nodes)
   storage/                   — Storage trait + LocalStorage + BlobReader
+  verify/                    — Read-only repository verifier
   restore/                   — RestoreEngine (parallel restore) + tree_walker + tree_cache
 ```
 

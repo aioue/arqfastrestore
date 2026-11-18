@@ -187,6 +187,26 @@ impl Node {
             (None, None)
         };
 
+        // Tree version 4 (written by newer Arq 7 releases) appends fields to every
+        // node after the reparse fields. They are not needed for restore, so they
+        // are read and discarded. The layout is undocumented; it was derived from
+        // real repositories (it decodes every sampled tree to its last byte):
+        //   [Int64 sec][Int64 nsec]               timestamp pair
+        //   [UInt32 ?][Bool a][Bool b]
+        //   [UInt64 x2] if a, [UInt64 x2] if b    (sizes; 4 MiB chunk info for big files)
+        // A wrong guess still fails loudly: the next node's name would not parse.
+        if tree_version >= 4 {
+            if !has_reparse {
+                r.skip(5).context("Node v4 reparse bytes")?;
+            }
+            r.skip(16).context("Node v4 timestamp")?;
+            r.read_u32_be().context("Node v4 reserved")?;
+            let a = r.read_bool().context("Node v4 flag a")?;
+            let b = r.read_bool().context("Node v4 flag b")?;
+            let pairs = usize::from(a) + usize::from(b);
+            r.skip(16 * pairs).context("Node v4 size fields")?;
+        }
+
         Ok(Self {
             is_tree,
             tree_blob_loc,
@@ -245,15 +265,17 @@ impl Tree {
             let header_end = r.position();
 
             // Attempt 1: parse WITH reparse fields.
-            match Self::parse_nodes(&mut r, version, count, true) {
+            let first_err = match Self::parse_nodes(&mut r, version, count, true) {
                 Ok(nodes) if r.is_empty() => return Ok(Self { version, nodes }),
-                _ => {}
-            }
+                Ok(_) => anyhow::anyhow!("{} unconsumed bytes", r.remaining()),
+                Err(e) => e,
+            };
 
             // Attempt 2: rewind and parse WITHOUT reparse fields.
             r.set_position(header_end);
-            let nodes = Self::parse_nodes(&mut r, version, count, false)
-                .context("Tree::parse failed both with and without reparse fields")?;
+            let nodes = Self::parse_nodes(&mut r, version, count, false).with_context(|| {
+                format!("Tree::parse failed both with ({first_err:#}) and without reparse fields")
+            })?;
             Ok(Self { version, nodes })
         } else {
             // tree_version < 2 never has reparse fields.
@@ -335,6 +357,87 @@ pub fn decompress_blob(data: &[u8], compression_type: u32) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Append an Arq string (`[Bool present][u64 len][bytes]`).
+    fn put_str(out: &mut Vec<u8>, v: &str) {
+        out.push(1);
+        out.extend_from_slice(&(v.len() as u64).to_be_bytes());
+        out.extend_from_slice(v.as_bytes());
+    }
+
+    /// Serialise one empty-file node as written by Arq 7 tree version `version`.
+    fn put_file_node(out: &mut Vec<u8>, version: u32, name: &str, big: bool) {
+        put_str(out, name);
+        out.push(0); // isTree
+        out.extend_from_slice(&1u32.to_be_bytes()); // computerOSType
+        out.extend_from_slice(&0u64.to_be_bytes()); // dataBlobLocsCount
+        out.push(0); // aclBlobLocIsNotNil
+        out.extend_from_slice(&0u64.to_be_bytes()); // xattrsBlobLocCount
+        out.extend_from_slice(&7u64.to_be_bytes()); // itemSize
+        out.extend_from_slice(&1u64.to_be_bytes()); // containedFilesCount
+        for t in [1i64, 2, 3, 4, 5, 6] {
+            out.extend_from_slice(&t.to_be_bytes()); // mtime, ctime, create time
+        }
+        put_str(out, "user");
+        put_str(out, "group");
+        out.push(0); // deleted
+        out.extend_from_slice(&0i32.to_be_bytes()); // st_dev
+        out.extend_from_slice(&42u64.to_be_bytes()); // st_ino
+        out.extend_from_slice(&0o100644u32.to_be_bytes()); // st_mode
+        out.extend_from_slice(&1u32.to_be_bytes()); // st_nlink
+        out.extend_from_slice(&501u32.to_be_bytes()); // st_uid
+        out.extend_from_slice(&20u32.to_be_bytes()); // st_gid
+        out.extend_from_slice(&0i32.to_be_bytes()); // st_rdev
+        out.extend_from_slice(&0i32.to_be_bytes()); // st_flags
+        out.extend_from_slice(&0u32.to_be_bytes()); // win_attrs
+        if version >= 2 {
+            out.extend_from_slice(&0u32.to_be_bytes()); // win_reparse_tag
+            out.push(0); // win_reparse_point_is_directory
+        }
+        if version >= 4 {
+            // timestamp pair + 22 reserved bytes, the shape seen in real v4 trees
+            out.extend_from_slice(&9i64.to_be_bytes());
+            out.extend_from_slice(&10i64.to_be_bytes());
+            out.extend_from_slice(&0u32.to_be_bytes());
+            out.push(1); // flag a
+            out.push(u8::from(big)); // flag b
+            out.extend_from_slice(&[0u8; 16]); // pair for a
+            if big {
+                out.extend_from_slice(&4_194_304u64.to_be_bytes()); // pair for b
+                out.extend_from_slice(&1u64.to_be_bytes());
+            }
+        }
+    }
+
+    fn build_tree(version: u32, names: &[&str]) -> Vec<u8> {
+        // Nodes whose name starts with "big" carry the second v4 field group.
+        let mut out = Vec::new();
+        out.extend_from_slice(&version.to_be_bytes());
+        out.extend_from_slice(&(names.len() as u64).to_be_bytes());
+        for n in names {
+            put_file_node(&mut out, version, n, n.starts_with("big"));
+        }
+        out
+    }
+
+    #[test]
+    fn parses_tree_versions_2_and_3() {
+        for v in [2, 3] {
+            let t = Tree::parse(&build_tree(v, &["a", "b"])).unwrap();
+            assert_eq!(t.version, v);
+            assert_eq!(t.nodes.len(), 2);
+        }
+    }
+
+    #[test]
+    fn parses_tree_version_4_node_tail() {
+        let t = Tree::parse(&build_tree(4, &["a", "big1", "c"])).unwrap();
+        assert_eq!(t.version, 4);
+        let names: Vec<_> = t.nodes.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["a", "big1", "c"]);
+        assert_eq!(t.nodes[2].1.mac_st_uid, 501);
+        assert_eq!(t.nodes[0].1.win_reparse_tag, Some(0));
+    }
 
     #[test]
     fn lz4_too_short() {

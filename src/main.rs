@@ -16,6 +16,7 @@ mod format;
 mod restore;
 mod scan;
 mod storage;
+mod verify;
 
 use crypto::{Arq5Keys, Arq7Keys, decrypt_arq5_object, decrypt_arq7_object};
 
@@ -154,6 +155,56 @@ enum Commands {
         /// network storage to keep the CPU/decrypt pipeline saturated.
         #[arg(long, default_value = "1")]
         pack_concurrency: usize,
+
+        /// Verify every blob's content against its identifier (sha256(salt||data)) while
+        /// restoring, on top of the always-on HMAC check. Mismatching files are reported
+        /// as failed. Arq 7 encrypted repositories only.
+        #[arg(long)]
+        verify: bool,
+    },
+    /// Verify repository integrity without restoring anything (read-only).
+    ///
+    /// Checks every backup record, walks every tree, and for every referenced
+    /// blob checks the file exists, the range fits, the ARQO HMAC-SHA256,
+    /// decryption, decompression and the blob identifier. Reports damaged packs
+    /// and the files that depend on them.
+    /// Exit status: 0 = clean, 2 = damage found, 1 = could not run.
+    Verify {
+        /// Path to the Arq plan directory (the <plan-uuid> folder)
+        #[arg(short, long)]
+        backup_path: String,
+
+        /// Backup encryption password. Use --password-file to avoid quoting special characters.
+        #[arg(short, long, env = "ARQ_PASSWORD")]
+        password: Option<String>,
+
+        /// Path to a file containing one password per line. Alternative to --password.
+        #[arg(long)]
+        password_file: Option<String>,
+
+        /// Number of parallel worker threads (default: number of CPU cores)
+        #[arg(short = 'j', long)]
+        threads: Option<usize>,
+
+        /// Print the full report as JSON on stdout instead of text
+        #[arg(long)]
+        json: bool,
+
+        /// Write a CSV of damaged blobs and the files that use them
+        #[arg(long)]
+        report: Option<String>,
+
+        /// Maximum affected files to print in the text report
+        #[arg(long, default_value = "50")]
+        max_files: usize,
+
+        /// Skip recomputing blob identifiers (HMAC/decrypt/decompress checks still run)
+        #[arg(long)]
+        no_identifier_check: bool,
+
+        /// Verify only the newest N backup records (much faster; default: all)
+        #[arg(long)]
+        latest: Option<usize>,
     },
     /// Restore specific files from a scan CSV (rows with action=restore)
     RestoreFromCsv {
@@ -428,6 +479,7 @@ fn main() -> Result<()> {
             cache_path,
             no_cache,
             pack_concurrency,
+            verify,
         } => {
             let password = resolve_password(password, password_file)?;
             if let Some(n) = threads {
@@ -439,6 +491,14 @@ fn main() -> Result<()> {
 
             let bp = PathBuf::from(&backup_path);
             let fmt = detect_format(&bp, &password)?;
+            if verify {
+                match &fmt {
+                    BackupFormat::Arq7(keys) => {
+                        storage::enable_identifier_verification(keys.keys[2].clone());
+                    }
+                    _ => bail!("--verify needs an encrypted Arq 7 repository"),
+                }
+            }
 
             match fmt {
                 BackupFormat::Arq5(keys) => {
@@ -475,6 +535,53 @@ fn main() -> Result<()> {
                 }
             }
 
+            Ok(())
+        }
+        Commands::Verify {
+            backup_path,
+            password,
+            password_file,
+            threads,
+            json,
+            report,
+            max_files,
+            no_identifier_check,
+            latest,
+        } => {
+            let password = resolve_password(password, password_file)?;
+            if let Some(n) = threads {
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(n)
+                    .build_global()
+                    .ok();
+            }
+            let plan_dir = PathBuf::from(&backup_path);
+            let BackupFormat::Arq7(keys) = detect_format(&plan_dir, &password)? else {
+                bail!("verify supports encrypted Arq 7 plan directories only (no encryptedkeyset.dat found)");
+            };
+            let storage_root = plan_dir
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| PathBuf::from("."));
+            let opts = verify::VerifyOptions {
+                storage_root,
+                plan_dir,
+                keys,
+                check_identifier: !no_identifier_check,
+                json,
+                report_csv: report.map(PathBuf::from),
+                max_files_printed: max_files,
+                latest,
+            };
+            let rep = verify::run(&opts)?;
+            if opts.json {
+                println!("{}", serde_json::to_string_pretty(&rep)?);
+            } else {
+                verify::print_text(&rep, opts.max_files_printed);
+            }
+            if !rep.is_clean() {
+                std::process::exit(2);
+            }
             Ok(())
         }
         Commands::RestoreFromCsv {
