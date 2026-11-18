@@ -25,6 +25,7 @@ use std::fs::File;
 use std::io::Write;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{Context, Result};
@@ -39,6 +40,12 @@ use crate::format::backup_record::parse_backup_record_bytes;
 const ARQO_MAGIC: &[u8] = b"ARQO";
 /// A run of at least this many zero bytes inside a damaged blob is reported.
 const MIN_ZERO_RUN: usize = 512;
+/// Largest single read when neighbouring blobs of one pack are read together.
+const MAX_COALESCED_READ: u64 = 8 << 20;
+/// Largest gap between neighbouring blobs that is read through rather than skipped.
+const MAX_COALESCE_GAP: u64 = 64 << 10;
+/// Trees of one pack handed to a single worker in the tree walk.
+const TREE_BATCH: usize = 256;
 
 // ---------------------------------------------------------------------------
 // Failure model
@@ -186,12 +193,11 @@ impl IdFormula {
 // ---------------------------------------------------------------------------
 
 /// Storage-relative path of the file holding `loc`.
-fn loc_path(loc: &BlobLoc) -> String {
+fn loc_path(loc: &BlobLoc) -> &str {
     loc.relative_path
         .as_deref()
         .unwrap_or(&loc.identifier)
         .trim_start_matches('/')
-        .to_owned()
 }
 
 /// Decrypted (still compressed) and decompressed bytes of a blob.
@@ -200,12 +206,14 @@ struct Fetched {
     plain: Vec<u8>,
 }
 
-/// Fetch the stored bytes of `loc` from an already-open file.
-fn read_stored(file: &File, loc: &BlobLoc, path: &str) -> Result<Vec<u8>, BlobFailure> {
-    let size = file
-        .metadata()
-        .map_err(|e| BlobFailure::simple(FailKind::ReadError, format!("stat {path}: {e}")))?
-        .len();
+fn file_size(file: &File, path: &str) -> Result<u64, BlobFailure> {
+    file.metadata()
+        .map(|m| m.len())
+        .map_err(|e| BlobFailure::simple(FailKind::ReadError, format!("stat {path}: {e}")))
+}
+
+/// `(offset, length)` of the stored bytes of `loc` in a file of `size` bytes.
+fn stored_range(loc: &BlobLoc, size: u64, path: &str) -> Result<(u64, u64), BlobFailure> {
     let (offset, length) = if loc.is_packed {
         (loc.offset, loc.length)
     } else {
@@ -218,6 +226,12 @@ fn read_stored(file: &File, loc: &BlobLoc, path: &str) -> Result<Vec<u8>, BlobFa
             format!("{path}: blob needs bytes {offset}..{end} but the file is {size} bytes"),
         ));
     }
+    Ok((offset, length))
+}
+
+/// Fetch the stored bytes of `loc` from an already-open file of `size` bytes.
+fn read_stored(file: &File, size: u64, loc: &BlobLoc, path: &str) -> Result<Vec<u8>, BlobFailure> {
+    let (offset, length) = stored_range(loc, size, path)?;
     let mut buf = vec![0u8; length as usize];
     file.read_exact_at(&mut buf, offset).map_err(|e| {
         BlobFailure::simple(
@@ -226,6 +240,90 @@ fn read_stored(file: &File, loc: &BlobLoc, path: &str) -> Result<Vec<u8>, BlobFa
         )
     })?;
     Ok(buf)
+}
+
+/// Read the stored bytes of each of `locs` (all in `path`, sorted by offset)
+/// and call `f(index, bytes)` for each, in order.
+///
+/// The file is opened and sized once. Neighbouring packed blobs are fetched
+/// with one read of up to [`MAX_COALESCED_READ`] bytes; if that read fails,
+/// each blob is re-read on its own so an I/O error is attributed only to the
+/// blobs it really affects. Results are identical to calling [`read_stored`]
+/// per blob.
+fn for_each_stored(
+    root: &Path,
+    path: &str,
+    locs: &[&BlobLoc],
+    mut f: impl FnMut(usize, Result<&[u8], BlobFailure>),
+) {
+    let opened = open_pack(root, path).and_then(|file| {
+        let size = file_size(&file, path)?;
+        Ok((file, size))
+    });
+    let (file, size) = match opened {
+        Ok(v) => v,
+        Err(fail) => {
+            for i in 0..locs.len() {
+                f(i, Err(fail.clone()));
+            }
+            return;
+        }
+    };
+    let single = |loc: &BlobLoc| read_stored(&file, size, loc, path);
+
+    let mut i = 0;
+    while i < locs.len() {
+        let loc = locs[i];
+        let (start, length) = match stored_range(loc, size, path) {
+            Ok(r) => r,
+            Err(fail) => {
+                f(i, Err(fail));
+                i += 1;
+                continue;
+            }
+        };
+        // Extend a run of in-range packed neighbours.
+        let mut end = start + length;
+        let mut j = i + 1;
+        if loc.is_packed {
+            while let Some(next) = locs.get(j) {
+                let next_end = next.offset.saturating_add(next.length);
+                if !next.is_packed
+                    || next.offset < start
+                    || next_end > size
+                    || next.offset > end.saturating_add(MAX_COALESCE_GAP)
+                    || next_end.max(end) - start > MAX_COALESCED_READ
+                {
+                    break;
+                }
+                end = end.max(next_end);
+                j += 1;
+            }
+        }
+        if j == i + 1 {
+            match single(loc) {
+                Ok(buf) => f(i, Ok(&buf)),
+                Err(fail) => f(i, Err(fail)),
+            }
+            i += 1;
+            continue;
+        }
+        let mut buf = vec![0u8; (end - start) as usize];
+        if file.read_exact_at(&mut buf, start).is_ok() {
+            for (k, l) in locs.iter().enumerate().take(j).skip(i) {
+                let a = (l.offset - start) as usize;
+                f(k, Ok(&buf[a..a + l.length as usize]));
+            }
+        } else {
+            for (k, l) in locs.iter().enumerate().take(j).skip(i) {
+                match single(l) {
+                    Ok(buf) => f(k, Ok(&buf)),
+                    Err(fail) => f(k, Err(fail)),
+                }
+            }
+        }
+        i = j;
+    }
 }
 
 fn open_pack(root: &Path, path: &str) -> Result<File, BlobFailure> {
@@ -287,15 +385,22 @@ fn check_identifier(
 // Repository model
 // ---------------------------------------------------------------------------
 
-type BlobKey = (String, u64, u64);
+type BlobKey = (u32, u64, u64);
 
 struct BlobRef {
+    /// The blob's location with `relative_path` cleared: the path is held once,
+    /// shared, in `path` (10M blobs would otherwise each carry a copy).
     loc: BlobLoc,
-    path: String,
+    path: Arc<str>,
 }
 
+/// Distinct blob locations. Interning a location already seen allocates nothing.
 #[derive(Default)]
 struct Interner {
+    /// Storage-relative file path → path id.
+    path_ids: HashMap<Arc<str>, u32>,
+    paths: Vec<Arc<str>>,
+    /// (path id, offset, length) → blob index.
     map: HashMap<BlobKey, u32>,
     blobs: Vec<BlobRef>,
 }
@@ -303,14 +408,28 @@ struct Interner {
 impl Interner {
     fn intern(&mut self, loc: &BlobLoc) -> u32 {
         let path = loc_path(loc);
-        let key = (path.clone(), loc.offset, loc.length);
+        let pid = match self.path_ids.get(path) {
+            Some(&p) => p,
+            None => {
+                let p = self.paths.len() as u32;
+                let shared: Arc<str> = Arc::from(path);
+                self.paths.push(shared.clone());
+                self.path_ids.insert(shared, p);
+                p
+            }
+        };
+        let key = (pid, loc.offset, loc.length);
         if let Some(&i) = self.map.get(&key) {
             return i;
         }
         let i = self.blobs.len() as u32;
         self.blobs.push(BlobRef {
-            loc: loc.clone(),
-            path,
+            loc: BlobLoc {
+                identifier: loc.identifier.clone(),
+                relative_path: None,
+                ..*loc
+            },
+            path: self.paths[pid as usize].clone(),
         });
         self.map.insert(key, i);
         i
@@ -523,25 +642,64 @@ struct TreeRead {
     outcome: Result<Tree, BlobFailure>,
 }
 
-fn read_tree(root: &Path, keys: &Arq7Keys, loc: &BlobLoc, formula: Option<IdFormula>) -> TreeRead {
-    let path = loc_path(loc);
-    let outcome = (|| {
-        let file = open_pack(root, &path)?;
-        let raw = read_stored(&file, loc, &path)?;
-        let f = decode_stored(&raw, loc, keys)?;
-        check_identifier(&f, loc, keys, formula)?;
-        Tree::parse(&f.plain).map_err(|e| {
-            let head = hex::encode(&f.plain[..f.plain.len().min(65536)]);
-            BlobFailure::simple(
-                FailKind::TreeParseError,
-                format!("{e:#} (plaintext {} bytes, starts {head})", f.plain.len()),
-            )
-        })
-    })();
-    TreeRead {
-        loc: loc.clone(),
-        outcome,
+/// Check and parse one tree blob from its stored bytes.
+fn decode_tree(
+    raw: Result<&[u8], BlobFailure>,
+    loc: &BlobLoc,
+    keys: &Arq7Keys,
+    formula: Option<IdFormula>,
+) -> Result<Tree, BlobFailure> {
+    let f = decode_stored(raw?, loc, keys)?;
+    check_identifier(&f, loc, keys, formula)?;
+    Tree::parse(&f.plain).map_err(|e| {
+        let head = hex::encode(&f.plain[..f.plain.len().min(65536)]);
+        BlobFailure::simple(
+            FailKind::TreeParseError,
+            format!("{e:#} (plaintext {} bytes, starts {head})", f.plain.len()),
+        )
+    })
+}
+
+/// Read, check and parse every tree in `frontier`.
+///
+/// Trees are sorted by (file, offset) and handed out in batches of up to
+/// [`TREE_BATCH`] from one file, so each worker opens and sizes a pack once and
+/// reads neighbouring trees together instead of one open+stat+read per tree.
+fn read_trees(
+    root: &Path,
+    keys: &Arq7Keys,
+    frontier: Vec<BlobLoc>,
+    formula: Option<IdFormula>,
+) -> Vec<TreeRead> {
+    let mut frontier = frontier;
+    frontier.sort_by(|a, b| loc_path(a).cmp(loc_path(b)).then(a.offset.cmp(&b.offset)));
+    let mut batches: Vec<&[BlobLoc]> = Vec::new();
+    let mut rest = &frontier[..];
+    while let Some(first) = rest.first() {
+        let p = loc_path(first);
+        let n = rest
+            .iter()
+            .take(TREE_BATCH)
+            .take_while(|l| loc_path(l) == p)
+            .count();
+        let (batch, tail) = rest.split_at(n);
+        batches.push(batch);
+        rest = tail;
     }
+    batches
+        .par_iter()
+        .flat_map_iter(|batch| {
+            let locs: Vec<&BlobLoc> = batch.iter().collect();
+            let mut out = Vec::with_capacity(batch.len());
+            for_each_stored(root, loc_path(&batch[0]), &locs, |i, raw| {
+                out.push(TreeRead {
+                    loc: batch[i].clone(),
+                    outcome: decode_tree(raw, &batch[i], keys, formula),
+                });
+            });
+            out
+        })
+        .collect()
 }
 
 struct Model {
@@ -576,10 +734,12 @@ fn walk_trees(opts: &VerifyOptions, roots: &[BlobLoc], formula: Option<IdFormula
             frontier.len(),
             model.trees.len()
         );
-        let reads: Vec<TreeRead> = frontier
-            .par_iter()
-            .map(|loc| read_tree(&opts.storage_root, &opts.keys, loc, formula))
-            .collect();
+        let reads = read_trees(
+            &opts.storage_root,
+            &opts.keys,
+            std::mem::take(&mut frontier),
+            formula,
+        );
 
         let mut next: Vec<BlobLoc> = Vec::new();
         for tr in reads {
@@ -603,7 +763,10 @@ fn walk_trees(opts: &VerifyOptions, roots: &[BlobLoc], formula: Option<IdFormula
                             && let Some(sub) = &node.tree_blob_loc
                         {
                             info.subtrees.push((name.clone(), sub.identifier.clone()));
-                            if queued.insert(sub.identifier.clone()) {
+                            // Most subtree references are to trees already queued;
+                            // check before cloning the identifier.
+                            if !queued.contains(&sub.identifier) {
+                                queued.insert(sub.identifier.clone());
                                 next.push(sub.clone());
                             }
                         }
@@ -647,8 +810,9 @@ fn calibrate_formula(opts: &VerifyOptions, roots: &[BlobLoc]) -> Option<IdFormul
         .take(64)
         .filter_map(|loc| {
             let path = loc_path(loc);
-            let file = open_pack(&opts.storage_root, &path).ok()?;
-            let raw = read_stored(&file, loc, &path).ok()?;
+            let file = open_pack(&opts.storage_root, path).ok()?;
+            let size = file_size(&file, path).ok()?;
+            let raw = read_stored(&file, size, loc, path).ok()?;
             let f = decode_stored(&raw, loc, &opts.keys).ok()?;
             Some((loc, f))
         })
@@ -680,7 +844,7 @@ fn verify_blobs(
         if model.checked.contains(&i) {
             continue;
         }
-        by_path.entry(b.path.as_str()).or_default().push(i);
+        by_path.entry(&b.path).or_default().push(i);
     }
     let total: usize = by_path.values().map(Vec::len).sum();
     eprintln!("verify: checking {total} blobs in {} files", by_path.len());
@@ -694,26 +858,26 @@ fn verify_blobs(
         .flat_map_iter(|(path, idxs)| {
             let mut idxs = idxs.clone();
             idxs.sort_by_key(|&i| model.interner.blobs[i as usize].loc.offset);
+            let locs: Vec<&BlobLoc> = idxs
+                .iter()
+                .map(|&i| &model.interner.blobs[i as usize].loc)
+                .collect();
             let mut out = Vec::new();
-            let file = open_pack(&opts.storage_root, path);
-            for i in idxs {
-                let loc = &model.interner.blobs[i as usize].loc;
-                let res = match &file {
-                    Err(f) => Err(f.clone()),
-                    Ok(file) => read_stored(file, loc, path).and_then(|raw| {
-                        bytes.fetch_add(raw.len() as u64, Ordering::Relaxed);
-                        let f = decode_stored(&raw, loc, &opts.keys)?;
-                        check_identifier(&f, loc, &opts.keys, formula)
-                    }),
-                };
+            for_each_stored(&opts.storage_root, path, &locs, |k, raw| {
+                let loc = locs[k];
+                let res = raw.and_then(|raw| {
+                    bytes.fetch_add(raw.len() as u64, Ordering::Relaxed);
+                    let f = decode_stored(raw, loc, &opts.keys)?;
+                    check_identifier(&f, loc, &opts.keys, formula)
+                });
                 if let Err(f) = res {
-                    out.push((i, f));
+                    out.push((idxs[k], f));
                 }
                 let n = done.fetch_add(1, Ordering::Relaxed) + 1;
                 if n.is_multiple_of(25_000) {
                     eprintln!("verify: {n}/{total} blobs checked");
                 }
-            }
+            });
             out
         })
         .collect();
@@ -809,9 +973,9 @@ impl Impact<'_> {
             if !kinds.contains(&f.kind) {
                 kinds.push(f.kind);
             }
-            let p = &self.model.interner.blobs[*b as usize].path;
-            if !packs.contains(p) {
-                packs.push(p.clone());
+            let p: &str = &self.model.interner.blobs[*b as usize].path;
+            if !packs.iter().any(|x| x == p) {
+                packs.push(p.to_owned());
             }
         }
         out.entry(path.clone()).or_insert_with(|| AffectedFile {
@@ -919,13 +1083,15 @@ pub fn run(opts: &VerifyOptions) -> Result<VerifyReport> {
         }
         let b = &model.interner.blobs[*i as usize];
         *failures_by_kind.entry(format!("{:?}", f.kind)).or_default() += 1;
-        let p = packs.entry(b.path.clone()).or_insert_with(|| PackReport {
-            path: b.path.clone(),
-            bad_blobs: 0,
-            bad_bytes: 0,
-            zero_filled_blobs: 0,
-            kinds: BTreeMap::new(),
-        });
+        let p = packs
+            .entry(b.path.to_string())
+            .or_insert_with(|| PackReport {
+                path: b.path.to_string(),
+                bad_blobs: 0,
+                bad_bytes: 0,
+                zero_filled_blobs: 0,
+                kinds: BTreeMap::new(),
+            });
         p.bad_blobs += 1;
         p.bad_bytes += b.loc.length;
         if f.zero_filled {
@@ -1130,4 +1296,310 @@ pub fn print_text(r: &VerifyReport, max_files: usize) {
             "DAMAGE FOUND"
         }
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crypto::{encrypt_arqo, test_keys};
+
+    const PLAN: &str = "PLAN-1";
+
+    fn put_str(out: &mut Vec<u8>, v: &str) {
+        out.push(1);
+        out.extend_from_slice(&(v.len() as u64).to_be_bytes());
+        out.extend_from_slice(v.as_bytes());
+    }
+
+    fn put_loc(out: &mut Vec<u8>, l: &BlobLoc) {
+        put_str(out, &l.identifier);
+        out.push(u8::from(l.is_packed));
+        out.push(0); // isLargePack
+        match &l.relative_path {
+            Some(p) => put_str(out, p),
+            None => out.push(0),
+        }
+        out.extend_from_slice(&l.offset.to_be_bytes());
+        out.extend_from_slice(&l.length.to_be_bytes());
+        out.push(1); // stretchEncryptionKey
+        out.extend_from_slice(&l.compression_type.to_be_bytes());
+    }
+
+    /// A tree-version-3 tree of `(name, subtree, data blobs)` entries.
+    fn tree_bytes(entries: &[(&str, Option<&BlobLoc>, &[BlobLoc])]) -> Vec<u8> {
+        let mut out = 3u32.to_be_bytes().to_vec();
+        out.extend_from_slice(&(entries.len() as u64).to_be_bytes());
+        for (name, sub, data) in entries {
+            put_str(&mut out, name);
+            out.push(u8::from(sub.is_some()));
+            if let Some(s) = sub {
+                put_loc(&mut out, s);
+            }
+            out.extend_from_slice(&1u32.to_be_bytes()); // computerOSType
+            out.extend_from_slice(&(data.len() as u64).to_be_bytes());
+            for d in *data {
+                put_loc(&mut out, d);
+            }
+            out.push(0); // no ACL
+            out.extend_from_slice(&0u64.to_be_bytes()); // xattrs
+            out.extend_from_slice(&5u64.to_be_bytes()); // itemSize
+            out.extend_from_slice(&1u64.to_be_bytes()); // containedFilesCount
+            out.extend_from_slice(&[0u8; 48]); // six timestamps
+            put_str(&mut out, "user");
+            put_str(&mut out, "group");
+            out.push(0); // deleted
+            out.extend_from_slice(&[0u8; 40]); // dev, ino, mode, nlink, uid, gid, rdev, flags, win_attrs
+            out.extend_from_slice(&[0u8; 5]); // reparse tag + is-directory flag
+        }
+        out
+    }
+
+    fn lz4_frame(plain: &[u8]) -> Vec<u8> {
+        let mut out = (plain.len() as u32).to_be_bytes().to_vec();
+        out.extend_from_slice(&lz4_flex::compress(plain));
+        out
+    }
+
+    /// A synthetic encrypted Arq 7 plan in a temp directory.
+    struct Repo {
+        dir: tempfile::TempDir,
+        keys: Arq7Keys,
+        files: BTreeMap<String, Vec<u8>>,
+    }
+
+    impl Repo {
+        fn new() -> Self {
+            Self {
+                dir: tempfile::tempdir().unwrap(),
+                keys: test_keys(),
+                files: BTreeMap::new(),
+            }
+        }
+
+        fn stored(&self, plain: &[u8]) -> (String, Vec<u8>) {
+            let id = IdFormula::SaltPrefix.compute(&self.keys.keys[2], &[], plain);
+            (id, encrypt_arqo(&lz4_frame(plain), &self.keys))
+        }
+
+        /// Append `plain` to pack `pack` after `gap` filler bytes.
+        fn packed(&mut self, pack: &str, plain: &[u8], gap: usize) -> BlobLoc {
+            let (identifier, raw) = self.stored(plain);
+            let rel = format!("{PLAN}/{pack}");
+            let buf = self.files.entry(rel.clone()).or_default();
+            buf.extend(std::iter::repeat_n(0xEE, gap));
+            let offset = buf.len() as u64;
+            buf.extend_from_slice(&raw);
+            BlobLoc {
+                identifier,
+                is_packed: true,
+                is_large_pack: false,
+                relative_path: Some(format!("/{rel}")),
+                offset,
+                length: raw.len() as u64,
+                stretch_encryption_key: true,
+                compression_type: 2,
+                is_arq5_pack_entry: false,
+            }
+        }
+
+        fn standalone(&mut self, plain: &[u8]) -> BlobLoc {
+            let (identifier, raw) = self.stored(plain);
+            let rel = format!("{PLAN}/standardobjects/{identifier}");
+            self.files.insert(rel.clone(), raw.clone());
+            BlobLoc {
+                identifier,
+                is_packed: false,
+                is_large_pack: false,
+                relative_path: Some(format!("/{rel}")),
+                offset: 0,
+                length: raw.len() as u64,
+                stretch_encryption_key: true,
+                compression_type: 2,
+                is_arq5_pack_entry: false,
+            }
+        }
+
+        fn record(&mut self, ts: u64, root: &BlobLoc) {
+            let json = serde_json::json!({
+                "creationDate": ts as f64,
+                "localPath": "/src",
+                "isComplete": true,
+                "node": {"treeBlobLoc": {
+                    "blobIdentifier": root.identifier,
+                    "isPacked": root.is_packed,
+                    "relativePath": root.relative_path,
+                    "offset": root.offset,
+                    "length": root.length,
+                    "compressionType": root.compression_type,
+                }},
+            });
+            let raw = encrypt_arqo(&lz4_frame(json.to_string().as_bytes()), &self.keys);
+            self.files.insert(
+                format!("{PLAN}/backupfolders/F/backuprecords/00001/{ts}.backuprecord"),
+                raw,
+            );
+        }
+
+        fn write(&self) {
+            for (rel, data) in &self.files {
+                let p = self.dir.path().join(rel);
+                std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+                std::fs::write(p, data).unwrap();
+            }
+            std::fs::write(
+                self.dir.path().join(PLAN).join("backupconfig.json"),
+                br#"{"blobIdentifierType":2}"#,
+            )
+            .unwrap();
+        }
+
+        fn run(&self) -> VerifyReport {
+            run(&VerifyOptions {
+                storage_root: self.dir.path().to_path_buf(),
+                plan_dir: self.dir.path().join(PLAN),
+                keys: test_keys(),
+                check_identifier: true,
+                json: false,
+                report_csv: None,
+                max_files_printed: 10,
+                latest: None,
+            })
+            .unwrap()
+        }
+    }
+
+    /// root/{dir/{file1, file2}, big} with file1 and file2 neighbours in one pack.
+    fn sample_repo() -> (Repo, BlobLoc, BlobLoc) {
+        let mut repo = Repo::new();
+        let f1 = repo.packed("blobpacks/bb/B.pack", b"first file content", 0);
+        let f2 = repo.packed("blobpacks/bb/B.pack", b"second file content", 100);
+        let big = repo.standalone(&[42u8; 5000]);
+        let dir = repo.packed(
+            "treepacks/aa/T.pack",
+            &tree_bytes(&[
+                ("file1", None, std::slice::from_ref(&f1)),
+                ("file2", None, std::slice::from_ref(&f2)),
+            ]),
+            0,
+        );
+        let root = repo.packed(
+            "treepacks/aa/T.pack",
+            &tree_bytes(&[("dir", Some(&dir), &[]), ("big", None, &[big])]),
+            0,
+        );
+        repo.record(1000, &root);
+        repo.record(2000, &root);
+        (repo, f1, f2)
+    }
+
+    #[test]
+    fn clean_repository_verifies_clean() {
+        let (repo, _, _) = sample_repo();
+        repo.write();
+        let r = repo.run();
+        assert!(r.is_clean(), "{:?}", r.failure_samples);
+        assert_eq!(r.records_total, 2);
+        assert_eq!(r.trees_checked, 2);
+        assert_eq!(r.blobs_checked, 5);
+        assert_eq!(
+            r.identifier_formula.as_deref(),
+            Some("sha256(salt||plaintext)")
+        );
+    }
+
+    #[test]
+    fn damaged_blob_is_reported_with_its_file() {
+        let (mut repo, f1, _) = sample_repo();
+        let pack = repo
+            .files
+            .get_mut(&format!("{PLAN}/blobpacks/bb/B.pack"))
+            .unwrap();
+        pack[(f1.offset + f1.length - 1) as usize] ^= 0xFF;
+        repo.write();
+        let r = repo.run();
+        assert_eq!(r.blobs_bad, 1);
+        assert_eq!(r.failures_by_kind.get("HmacMismatch"), Some(&1));
+        let paths: Vec<&str> = r.affected_files.iter().map(|a| a.path.as_str()).collect();
+        assert_eq!(paths, ["/src/dir/file1"]);
+        assert_eq!(r.affected_files[0].records_affected, 2);
+        assert_eq!(r.affected_files[0].newest_record, 2000);
+    }
+
+    #[test]
+    fn truncated_pack_reports_out_of_range() {
+        let (mut repo, _, f2) = sample_repo();
+        let pack = repo
+            .files
+            .get_mut(&format!("{PLAN}/blobpacks/bb/B.pack"))
+            .unwrap();
+        pack.truncate((f2.offset + 10) as usize);
+        repo.write();
+        let r = repo.run();
+        assert_eq!(r.failures_by_kind.get("OutOfRange"), Some(&1));
+        assert_eq!(r.blobs_bad, 1);
+    }
+
+    #[test]
+    fn coalesced_reads_match_single_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let data: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(dir.path().join("p"), &data).unwrap();
+        let loc = |offset: u64, length: u64| BlobLoc {
+            identifier: "x".into(),
+            is_packed: true,
+            is_large_pack: false,
+            relative_path: Some("p".into()),
+            offset,
+            length,
+            stretch_encryption_key: true,
+            compression_type: 0,
+            is_arq5_pack_entry: false,
+        };
+        // Neighbours, an overlap, a duplicate, a gap wider than MAX_COALESCE_GAP,
+        // and one past the end of the file.
+        let locs = [
+            loc(0, 10),
+            loc(10, 20),
+            loc(25, 10),
+            loc(25, 10),
+            loc(40, 1000),
+            loc(200_000, 5),
+            loc(299_990, 50),
+        ];
+        let refs: Vec<&BlobLoc> = locs.iter().collect();
+        let file = File::open(dir.path().join("p")).unwrap();
+        let mut got = Vec::new();
+        for_each_stored(dir.path(), "p", &refs, |i, raw| {
+            got.push((i, raw.map(<[u8]>::to_vec).map_err(|f| f.kind)));
+        });
+        assert_eq!(got.len(), locs.len());
+        for (i, res) in got {
+            let want = read_stored(&file, data.len() as u64, &locs[i], "p").map_err(|f| f.kind);
+            assert_eq!(res, want, "blob {i}");
+        }
+    }
+
+    #[test]
+    fn missing_pack_fails_every_blob_in_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let l = BlobLoc {
+            identifier: "x".into(),
+            is_packed: true,
+            is_large_pack: false,
+            relative_path: Some("nope".into()),
+            offset: 0,
+            length: 1,
+            stretch_encryption_key: true,
+            compression_type: 0,
+            is_arq5_pack_entry: false,
+        };
+        let mut kinds = Vec::new();
+        for_each_stored(dir.path(), "nope", &[&l, &l], |_, raw| {
+            kinds.push(raw.err().map(|f| f.kind));
+        });
+        assert_eq!(
+            kinds,
+            [Some(FailKind::MissingFile), Some(FailKind::MissingFile)]
+        );
+    }
 }

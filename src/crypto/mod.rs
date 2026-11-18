@@ -10,3 +10,8 @@ mod arq7;
 #[allow(unused_imports)]
 pub use arq5::{Arq5Keys, decrypt_arq5_object};
 pub use arq7::{Arq7Keys, decrypt_arq7_object};
+
+// Used by the verify tests, which are built only with the binary.
+#[cfg(test)]
+#[allow(unused_imports)]
+pub(crate) use arq7::tests::{encrypt_arqo, test_keys};
