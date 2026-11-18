@@ -182,19 +182,69 @@ pub fn decrypt_arq7_object(data: &[u8], keys: &Arq7Keys) -> Result<Vec<u8>> {
     let data_iv = &session_plain[..IV_SIZE];
     let session_key = &session_plain[IV_SIZE..IV_SIZE + 32];
 
-    // Decrypt ciphertext using session_key and data_iv
+    // Decrypt ciphertext in place using session_key and data_iv. The plaintext
+    // is a prefix of `buf`, so truncate instead of copying it out again.
     let mut buf = ciphertext.to_vec();
-    let plaintext = cbc::Decryptor::<Aes256>::new_from_slices(session_key, data_iv)
+    let plain_len = cbc::Decryptor::<Aes256>::new_from_slices(session_key, data_iv)
         .context("AES init failed for data")?
         .decrypt_padded_mut::<Pkcs7>(&mut buf)
-        .map_err(|e| anyhow::anyhow!("PKCS7 unpad failed for data: {e:?}"))?;
-
-    Ok(plaintext.to_vec())
+        .map_err(|e| anyhow::anyhow!("PKCS7 unpad failed for data: {e:?}"))?
+        .len();
+    buf.truncate(plain_len);
+    Ok(buf)
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// Build an ARQO object for `plain` the way Arq 7 writes one.
+    pub(crate) fn encrypt_arqo(plain: &[u8], keys: &Arq7Keys) -> Vec<u8> {
+        use cbc::cipher::BlockEncryptMut;
+        let master_iv = [3u8; IV_SIZE];
+        let data_iv = [5u8; IV_SIZE];
+        let session_key = [9u8; 32];
+        let mut session = data_iv.to_vec();
+        session.extend_from_slice(&session_key);
+        let enc_session =
+            cbc::Encryptor::<Aes256>::new_from_slices(&keys.keys[0][..32], &master_iv)
+                .unwrap()
+                .encrypt_padded_vec_mut::<Pkcs7>(&session);
+        assert_eq!(enc_session.len(), ENC_SESSION_BLOB_SIZE);
+        let ciphertext = cbc::Encryptor::<Aes256>::new_from_slices(&session_key, &data_iv)
+            .unwrap()
+            .encrypt_padded_vec_mut::<Pkcs7>(plain);
+        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&keys.keys[1]).unwrap();
+        mac.update(&master_iv);
+        mac.update(&enc_session);
+        mac.update(&ciphertext);
+        let mut out = ARQO_MAGIC.to_vec();
+        out.extend_from_slice(&mac.finalize().into_bytes());
+        out.extend_from_slice(&master_iv);
+        out.extend_from_slice(&enc_session);
+        out.extend_from_slice(&ciphertext);
+        out
+    }
+
+    pub(crate) fn test_keys() -> Arq7Keys {
+        Arq7Keys {
+            keys: [vec![1u8; 64], vec![2u8; 64], vec![4u8; 32]],
+        }
+    }
+
+    #[test]
+    fn arqo_roundtrip_and_tamper_detected() {
+        let keys = test_keys();
+        for plain in [&b""[..], b"x", b"exactly sixteen!", &[7u8; 1000][..]] {
+            let obj = encrypt_arqo(plain, &keys);
+            assert_eq!(decrypt_arq7_object(&obj, &keys).unwrap(), plain);
+        }
+        let mut obj = encrypt_arqo(b"hello", &keys);
+        let last = obj.len() - 1;
+        obj[last] ^= 1;
+        let err = decrypt_arq7_object(&obj, &keys).unwrap_err();
+        assert!(format!("{err:#}").contains("HMAC"));
+    }
 
     #[test]
     fn bad_header_rejected() {
