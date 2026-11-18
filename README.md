@@ -164,6 +164,12 @@ flagged when zero-filled or containing long zero runs (a bad sector replaced by 
 Each damaged blob is mapped back to the files and snapshots that use it, so damaged
 data can be re-backed up.
 
+When the identifier formula is known, verify also reports damaged blobs whose
+identifier is stored intact at another location in the plan (a copy that passed every
+check, so its content is provably the same): the text report counts them, the JSON
+marks affected files `recoverable_from_copies`, and the CSV's `intact_copy` column
+names the copy as `<pack>@<offset>`. This is reporting only; nothing is repaired.
+
 | Flag | Description |
 |------|-------------|
 | `--backup-path` / `-b` | The plan directory (`<plan-uuid>`) |

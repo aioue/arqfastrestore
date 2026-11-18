@@ -475,6 +475,8 @@ pub struct AffectedFile {
     pub records_affected: u32,
     pub kinds: Vec<FailKind>,
     pub packs: Vec<String>,
+    /// Every damaged blob of this file has an intact copy elsewhere.
+    pub recoverable_from_copies: bool,
     #[serde(skip)]
     blobs: Vec<u32>,
 }
@@ -491,6 +493,10 @@ pub struct VerifyReport {
     pub trees_broken: usize,
     pub blobs_checked: usize,
     pub blobs_bad: usize,
+    /// Damaged blobs whose identifier is also stored at another location that
+    /// passed every check, including the identifier check. Their content is
+    /// recoverable from that copy. Counted only when the formula is known.
+    pub blobs_bad_with_intact_copy: usize,
     pub bytes_checked: u64,
     pub failures_by_kind: BTreeMap<String, usize>,
     /// Up to three example failure messages per kind.
@@ -897,6 +903,8 @@ fn verify_blobs(
 struct Impact<'a> {
     model: &'a Model,
     failures: &'a HashMap<u32, BlobFailure>,
+    /// damaged blob -> an intact copy of it
+    copies: &'a HashMap<u32, u32>,
     /// tree identifier -> the tree or something below it is damaged
     bad: HashMap<String, bool>,
 }
@@ -978,15 +986,46 @@ impl Impact<'_> {
                 packs.push(p.to_owned());
             }
         }
+        let recoverable_from_copies = bad_blobs.iter().all(|b| self.copies.contains_key(b));
         out.entry(path.clone()).or_insert_with(|| AffectedFile {
             path,
             newest_record: record_ts,
             records_affected: 1,
             kinds,
             packs,
+            recoverable_from_copies,
             blobs: bad_blobs,
         });
     }
+}
+
+/// For each damaged blob, another interned location with the same identifier
+/// that passed every check, if any.
+///
+/// Every interned location is checked, so a location absent from `failures`
+/// decrypted, decompressed and hashed to its identifier; with the identifier
+/// formula known that proves it holds the same content. Trees are walked once
+/// per identifier, so in practice only data blobs can have copies.
+fn intact_copies(model: &Model, failures: &HashMap<u32, BlobFailure>) -> HashMap<u32, u32> {
+    let blobs = &model.interner.blobs;
+    let wanted: HashSet<&str> = failures
+        .keys()
+        .map(|i| blobs[*i as usize].loc.identifier.as_str())
+        .collect();
+    let mut good: HashMap<&str, u32> = HashMap::new();
+    for (i, b) in blobs.iter().enumerate() {
+        let id = b.loc.identifier.as_str();
+        if wanted.contains(id) && !failures.contains_key(&(i as u32)) {
+            good.entry(id).or_insert(i as u32);
+        }
+    }
+    failures
+        .keys()
+        .filter_map(|i| {
+            let id = blobs[*i as usize].loc.identifier.as_str();
+            good.get(id).map(|g| (*i, *g))
+        })
+        .collect()
 }
 
 /// Merge `from` into `into`: counts add up, the newest record wins.
@@ -1070,6 +1109,13 @@ pub fn run(opts: &VerifyOptions) -> Result<VerifyReport> {
     let (blob_failures, bytes_checked) = verify_blobs(opts, &model, formula);
     failures.extend(blob_failures);
 
+    // Damaged blobs with an intact copy elsewhere (read-only; nothing is repaired).
+    let copies = if formula.is_some() {
+        intact_copies(&model, &failures)
+    } else {
+        HashMap::new()
+    };
+
     // Report assembly
     let mut failures_by_kind: BTreeMap<String, usize> = BTreeMap::new();
     let mut packs: BTreeMap<String, PackReport> = BTreeMap::new();
@@ -1111,6 +1157,7 @@ pub fn run(opts: &VerifyOptions) -> Result<VerifyReport> {
         let mut impact = Impact {
             model: &model,
             failures: &failures,
+            copies: &copies,
             bad: HashMap::new(),
         };
         for r in &records {
@@ -1133,7 +1180,7 @@ pub fn run(opts: &VerifyOptions) -> Result<VerifyReport> {
     }
 
     if let Some(csv) = &opts.report_csv {
-        write_csv(csv, &model, &failures, &affected)?;
+        write_csv(csv, &model, &failures, &copies, &affected)?;
     }
 
     let records_unreadable = records
@@ -1165,6 +1212,7 @@ pub fn run(opts: &VerifyOptions) -> Result<VerifyReport> {
         trees_broken: model.trees.values().filter(|t| t.broken).count(),
         blobs_checked: model.interner.blobs.len(),
         blobs_bad: failures.len(),
+        blobs_bad_with_intact_copy: copies.len(),
         bytes_checked,
         failures_by_kind,
         failure_samples,
@@ -1186,6 +1234,7 @@ fn write_csv(
     path: &Path,
     model: &Model,
     failures: &HashMap<u32, BlobFailure>,
+    copies: &HashMap<u32, u32>,
     affected: &BTreeMap<String, AffectedFile>,
 ) -> Result<()> {
     let mut f = std::io::BufWriter::new(
@@ -1193,15 +1242,19 @@ fn write_csv(
     );
     writeln!(
         f,
-        "kind,pack,offset,length,identifier,zero_filled,max_zero_run,newest_record,records_affected,path"
+        "kind,pack,offset,length,identifier,zero_filled,max_zero_run,newest_record,records_affected,path,intact_copy"
     )?;
     for a in affected.values() {
         for i in &a.blobs {
             let b = &model.interner.blobs[*i as usize];
             let fail = &failures[i];
+            let copy = copies.get(i).map_or(String::new(), |c| {
+                let c = &model.interner.blobs[*c as usize];
+                format!("{}@{}", c.path, c.loc.offset)
+            });
             writeln!(
                 f,
-                "{:?},{},{},{},{},{},{},{},{},{}",
+                "{:?},{},{},{},{},{},{},{},{},{},{}",
                 fail.kind,
                 csv_escape(&b.path),
                 b.loc.offset,
@@ -1212,6 +1265,7 @@ fn write_csv(
                 a.newest_record,
                 a.records_affected,
                 csv_escape(&a.path),
+                csv_escape(&copy),
             )?;
         }
     }
@@ -1261,6 +1315,12 @@ pub fn print_text(r: &VerifyReport, max_files: usize) {
     );
     for (k, n) in &r.failures_by_kind {
         println!("    {k}: {n}");
+    }
+    if r.blobs_bad > 0 && r.identifier_formula.is_some() {
+        println!(
+            "  bad blobs with an intact copy elsewhere in the plan: {}",
+            r.blobs_bad_with_intact_copy
+        );
     }
     if !r.bad_packs.is_empty() {
         println!(
@@ -1523,6 +1583,62 @@ mod tests {
         assert_eq!(paths, ["/src/dir/file1"]);
         assert_eq!(r.affected_files[0].records_affected, 2);
         assert_eq!(r.affected_files[0].newest_record, 2000);
+    }
+
+    #[test]
+    fn damaged_blob_with_a_second_copy_is_reported_recoverable() {
+        let mut repo = Repo::new();
+        let a = repo.packed("blobpacks/bb/A.pack", b"same content", 0);
+        let b = repo.packed("blobpacks/bb/B.pack", b"same content", 0);
+        let other = repo.packed("blobpacks/bb/B.pack", b"only copy", 0);
+        assert_eq!(a.identifier, b.identifier);
+        let root = repo.packed(
+            "treepacks/aa/T.pack",
+            &tree_bytes(&[
+                ("old", None, std::slice::from_ref(&a)),
+                ("new", None, std::slice::from_ref(&b)),
+                ("solo", None, std::slice::from_ref(&other)),
+            ]),
+            0,
+        );
+        repo.record(1000, &root);
+        let pa = repo
+            .files
+            .get_mut(&format!("{PLAN}/blobpacks/bb/A.pack"))
+            .unwrap();
+        pa[(a.offset + a.length - 1) as usize] ^= 0xFF;
+        let pb = repo
+            .files
+            .get_mut(&format!("{PLAN}/blobpacks/bb/B.pack"))
+            .unwrap();
+        pb[(other.offset + other.length - 1) as usize] ^= 0xFF;
+        repo.write();
+        let csv = repo.dir.path().join("report.csv");
+        let r = run(&VerifyOptions {
+            storage_root: repo.dir.path().to_path_buf(),
+            plan_dir: repo.dir.path().join(PLAN),
+            keys: test_keys(),
+            check_identifier: true,
+            json: false,
+            report_csv: Some(csv.clone()),
+            max_files_printed: 10,
+            latest: None,
+        })
+        .unwrap();
+
+        assert_eq!(r.blobs_bad, 2);
+        assert_eq!(r.blobs_bad_with_intact_copy, 1);
+        let rec: Vec<(&str, bool)> = r
+            .affected_files
+            .iter()
+            .map(|a| (a.path.as_str(), a.recoverable_from_copies))
+            .collect();
+        assert_eq!(rec, [("/src/old", true), ("/src/solo", false)]);
+        let text = std::fs::read_to_string(csv).unwrap();
+        let old_row = text.lines().find(|l| l.contains("/src/old")).unwrap();
+        assert!(old_row.ends_with(&format!("{PLAN}/blobpacks/bb/B.pack@{}", b.offset)));
+        let solo_row = text.lines().find(|l| l.contains("/src/solo")).unwrap();
+        assert!(solo_row.ends_with(','));
     }
 
     #[test]
