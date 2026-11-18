@@ -31,9 +31,9 @@ impl<'a> Reader<'a> {
 
     /// Read exactly `n` bytes.
     pub fn read_bytes(&mut self, n: usize) -> Result<&'a [u8]> {
-        // checked_add: a corrupt length near usize::MAX must not wrap (release
+        // saturating_add: a corrupt length near usize::MAX must not wrap (release
         // builds have no overflow checks) and then panic on the slice below.
-        let end = self.pos.checked_add(n).unwrap_or(usize::MAX);
+        let end = self.pos.saturating_add(n);
         if end > self.data.len() {
             bail!(
                 "read_bytes({n}): only {} bytes remain at offset {}",
@@ -125,7 +125,7 @@ impl<'a> Reader<'a> {
     /// Peek at the next `n` bytes without advancing the cursor.
     #[allow(dead_code)]
     pub fn peek_bytes(&self, n: usize) -> Result<&'a [u8]> {
-        let end = self.pos.checked_add(n).unwrap_or(usize::MAX);
+        let end = self.pos.saturating_add(n);
         if end > self.data.len() {
             bail!(
                 "peek_bytes({n}): only {} bytes remain at offset {}",
