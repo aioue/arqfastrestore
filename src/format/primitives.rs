@@ -31,7 +31,9 @@ impl<'a> Reader<'a> {
 
     /// Read exactly `n` bytes.
     pub fn read_bytes(&mut self, n: usize) -> Result<&'a [u8]> {
-        let end = self.pos + n;
+        // checked_add: a corrupt length near usize::MAX must not wrap (release
+        // builds have no overflow checks) and then panic on the slice below.
+        let end = self.pos.checked_add(n).unwrap_or(usize::MAX);
         if end > self.data.len() {
             bail!(
                 "read_bytes({n}): only {} bytes remain at offset {}",
@@ -100,6 +102,14 @@ impl<'a> Reader<'a> {
         Ok(Some(s))
     }
 
+    /// Capacity to reserve for `count` items read from untrusted data, each at
+    /// least `min_item_bytes` long. Never more than the remaining bytes allow, so
+    /// a corrupt count cannot trigger a huge allocation (which aborts the process).
+    pub fn bounded_capacity(&self, count: u64, min_item_bytes: usize) -> usize {
+        let fit = self.remaining() / min_item_bytes.max(1);
+        usize::try_from(count).unwrap_or(usize::MAX).min(fit)
+    }
+
     /// Like `read_string` but fails if null.
     pub fn read_string_required(&mut self) -> Result<String> {
         self.read_string()?.context("unexpected null Arq string")
@@ -115,7 +125,7 @@ impl<'a> Reader<'a> {
     /// Peek at the next `n` bytes without advancing the cursor.
     #[allow(dead_code)]
     pub fn peek_bytes(&self, n: usize) -> Result<&'a [u8]> {
-        let end = self.pos + n;
+        let end = self.pos.checked_add(n).unwrap_or(usize::MAX);
         if end > self.data.len() {
             bail!(
                 "peek_bytes({n}): only {} bytes remain at offset {}",
@@ -134,7 +144,11 @@ impl<'a> Reader<'a> {
     /// Skip `n` bytes.
     #[allow(dead_code)]
     pub fn skip(&mut self, n: usize) -> Result<()> {
-        if self.pos + n > self.data.len() {
+        if self
+            .pos
+            .checked_add(n)
+            .is_none_or(|end| end > self.data.len())
+        {
             bail!(
                 "skip({n}): only {} bytes remain at offset {}",
                 self.remaining(),
@@ -186,6 +200,29 @@ mod tests {
         let mut r = Reader::new(&data);
         assert_eq!(r.read_string().unwrap(), None);
         assert!(r.is_empty());
+    }
+
+    #[test]
+    fn huge_string_length_is_an_error_not_a_panic() {
+        // pos=9 after the flag and length; len near usize::MAX would wrap pos + len.
+        let mut data = vec![0x01];
+        data.extend_from_slice(&(u64::MAX - 3).to_be_bytes());
+        data.extend_from_slice(b"abc");
+        let mut r = Reader::new(&data);
+        assert!(r.read_string().is_err());
+        let mut r = Reader::new(&data);
+        r.read_u8().unwrap();
+        assert!(r.skip(usize::MAX).is_err());
+        assert!(r.peek_bytes(usize::MAX).is_err());
+    }
+
+    #[test]
+    fn bounded_capacity_caps_by_remaining_bytes() {
+        let data = [0u8; 100];
+        let r = Reader::new(&data);
+        assert_eq!(r.bounded_capacity(u64::MAX, 10), 10);
+        assert_eq!(r.bounded_capacity(3, 10), 3);
+        assert_eq!(r.bounded_capacity(5, 0), 5);
     }
 
     #[test]

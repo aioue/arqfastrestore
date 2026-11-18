@@ -21,6 +21,12 @@ pub const OS_TYPE_MAC: u8 = 1;
 #[allow(dead_code)]
 pub const OS_TYPE_WINDOWS: u8 = 2;
 
+/// Smallest possible serialised `BlobLoc` (empty identifier, null path); used
+/// only to bound pre-allocation from counts read out of untrusted bytes.
+const MIN_BLOB_LOC_BYTES: usize = 32;
+/// Smallest possible serialised (name, node) pair, for the same purpose.
+const MIN_NODE_BYTES: usize = 100;
+
 /// Location of a blob, either in a pack file or as a standalone object.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlobLoc {
@@ -130,7 +136,8 @@ impl Node {
         let computer_os_type = r.read_u32_be().context("Node computer_os_type")?;
 
         let data_blob_count = r.read_u64_be().context("Node data_blob_count")?;
-        let mut data_blob_locs = Vec::with_capacity(data_blob_count as usize);
+        let mut data_blob_locs =
+            Vec::with_capacity(r.bounded_capacity(data_blob_count, MIN_BLOB_LOC_BYTES));
         for i in 0..data_blob_count {
             data_blob_locs.push(
                 BlobLoc::parse(r, tree_version)
@@ -146,7 +153,8 @@ impl Node {
         };
 
         let xattrs_count = r.read_u64_be().context("Node xattrs_count")?;
-        let mut xattrs_blob_locs = Vec::with_capacity(xattrs_count as usize);
+        let mut xattrs_blob_locs =
+            Vec::with_capacity(r.bounded_capacity(xattrs_count, MIN_BLOB_LOC_BYTES));
         for i in 0..xattrs_count {
             xattrs_blob_locs.push(
                 BlobLoc::parse(r, tree_version)
@@ -294,7 +302,7 @@ impl Tree {
         count: u64,
         has_reparse: bool,
     ) -> Result<Vec<(String, Node)>> {
-        let mut nodes = Vec::with_capacity(count as usize);
+        let mut nodes = Vec::with_capacity(r.bounded_capacity(count, MIN_NODE_BYTES));
         for i in 0..count {
             let pos_before_name = r.position();
             let name = r.read_string_required().with_context(|| {
@@ -444,6 +452,23 @@ mod tests {
         assert_eq!(names, ["a", "big1", "noflag", "c"]);
         assert_eq!(t.nodes[3].1.mac_st_uid, 501);
         assert_eq!(t.nodes[0].1.win_reparse_tag, Some(0));
+    }
+
+    #[test]
+    fn corrupt_counts_fail_without_huge_allocation() {
+        // Node count u64::MAX: must be a parse error, not a capacity-overflow panic.
+        let mut data = 2u32.to_be_bytes().to_vec();
+        data.extend_from_slice(&u64::MAX.to_be_bytes());
+        assert!(Tree::parse(&data).is_err());
+
+        // One node whose data_blob_count is u64::MAX.
+        let mut data = 2u32.to_be_bytes().to_vec();
+        data.extend_from_slice(&1u64.to_be_bytes());
+        put_str(&mut data, "f");
+        data.push(0); // isTree
+        data.extend_from_slice(&1u32.to_be_bytes()); // computerOSType
+        data.extend_from_slice(&u64::MAX.to_be_bytes()); // dataBlobLocsCount
+        assert!(Tree::parse(&data).is_err());
     }
 
     #[test]
