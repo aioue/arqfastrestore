@@ -187,27 +187,27 @@ impl Node {
             (None, None)
         };
 
-        // Tree version 4 (written by newer Arq 7 releases) appends fields to every
-        // node after the reparse fields. They are not needed for restore, so they
-        // are read and discarded. The layout is undocumented; it was derived from
-        // real repositories (it decodes every sampled tree to its last byte):
-        //   [Int64 sec][Int64 nsec]               timestamp pair
-        //   [UInt32 ?][Bool a][Bool b]
-        //   [UInt64 x2]                           always
-        //   [UInt64 x2]                           only if b (4 MiB chunk info for big files)
-        // `a` does not change the length. Verified on ~3M trees from a real repository.
-        // A wrong guess still fails loudly: the next node's name would not parse.
+        // Tree version >= 4 appends added-time, document-id and sparse-file fields
+        // (see Arq 7 dataFormat.html). They are read only to stay in step with the
+        // byte stream; restore does not use them (sparse-file holes are not
+        // reconstructed, which is fine for ordinary files).
         if tree_version >= 4 {
             if !has_reparse {
                 r.skip(5).context("Node v4 reparse bytes")?;
             }
-            r.skip(16).context("Node v4 timestamp")?;
-            r.read_u32_be().context("Node v4 reserved")?;
-            let a = r.read_bool().context("Node v4 flag a")?;
-            let b = r.read_bool().context("Node v4 flag b")?;
-            let _ = a;
-            let pairs = 1 + usize::from(b);
-            r.skip(16 * pairs).context("Node v4 size fields")?;
+            r.read_i64_be().context("Node added_time_sec")?;
+            r.read_i64_be().context("Node added_time_nsec")?;
+            r.read_u32_be().context("Node document_id")?;
+            r.read_bool().context("Node has_document_id")?;
+            r.read_bool().context("Node is_sparse")?;
+            r.read_u64_be().context("Node sparse_logical_size")?;
+            let hole_count = r.read_u64_be().context("Node hole_count")?;
+            for i in 0..hole_count {
+                r.read_u64_be()
+                    .with_context(|| format!("Node hole_offset[{i}]"))?;
+                r.read_u64_be()
+                    .with_context(|| format!("Node hole_length[{i}]"))?;
+            }
         }
 
         Ok(Self {
@@ -401,13 +401,17 @@ mod tests {
             // timestamp pair + 22 reserved bytes, the shape seen in real v4 trees
             out.extend_from_slice(&9i64.to_be_bytes());
             out.extend_from_slice(&10i64.to_be_bytes());
-            out.extend_from_slice(&0u32.to_be_bytes());
-            out.push(u8::from(!name.starts_with("noflag"))); // flag a
-            out.push(u8::from(big)); // flag b
-            out.extend_from_slice(&[0u8; 16]); // always-present pair
+            out.extend_from_slice(&0u32.to_be_bytes()); // document_id
+            out.push(u8::from(!name.starts_with("noflag"))); // has_document_id
+            out.push(u8::from(big)); // is_sparse
+            out.extend_from_slice(&4_194_304u64.to_be_bytes()); // sparse_logical_size
             if big {
-                out.extend_from_slice(&4_194_304u64.to_be_bytes()); // pair for b
-                out.extend_from_slice(&1u64.to_be_bytes());
+                out.extend_from_slice(&2u64.to_be_bytes()); // hole_count
+                for v in [0u64, 4096, 8192, 4096] {
+                    out.extend_from_slice(&v.to_be_bytes()); // (offset, length) x2
+                }
+            } else {
+                out.extend_from_slice(&0u64.to_be_bytes());
             }
         }
     }
