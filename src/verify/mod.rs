@@ -725,21 +725,27 @@ fn verify_blobs(
 // Phase 4: impact
 // ---------------------------------------------------------------------------
 
+/// Maps damaged blobs back to the files that use them.
+///
+/// Two steps: `mark_bad` classifies every tree once (sequential, memoised), then
+/// `collect` walks only the damaged subtrees of one record against that read-only
+/// memo, so records can be processed in parallel.
 struct Impact<'a> {
     model: &'a Model,
     failures: &'a HashMap<u32, BlobFailure>,
-    memo: HashMap<String, bool>,
+    /// tree identifier -> the tree or something below it is damaged
+    bad: HashMap<String, bool>,
 }
 
 impl Impact<'_> {
-    fn tree_bad(&mut self, id: &str) -> bool {
-        if let Some(&b) = self.memo.get(id) {
+    fn mark_bad(&mut self, id: &str) -> bool {
+        if let Some(&b) = self.bad.get(id) {
             return b;
         }
         // Guard against cycles (corrupt data) by pre-seeding.
-        self.memo.insert(id.to_owned(), false);
+        self.bad.insert(id.to_owned(), false);
         let Some(info) = self.model.trees.get(id) else {
-            self.memo.insert(id.to_owned(), true);
+            self.bad.insert(id.to_owned(), true);
             return true;
         };
         let mut bad = info.broken || self.failures.contains_key(&info.self_blob);
@@ -747,98 +753,98 @@ impl Impact<'_> {
             .files
             .iter()
             .any(|(_, bl)| bl.iter().any(|b| self.failures.contains_key(b)));
-        if !bad {
-            let subs: Vec<String> = info.subtrees.iter().map(|(_, s)| s.clone()).collect();
-            for s in subs {
-                if self.tree_bad(&s) {
-                    bad = true;
-                    break;
-                }
-            }
+        // Visit every child (no early exit) so all of them end up in the memo.
+        for (_, sub) in &info.subtrees {
+            bad |= self.mark_bad(sub);
         }
-        self.memo.insert(id.to_owned(), bad);
+        self.bad.insert(id.to_owned(), bad);
         bad
     }
 
     fn collect(
-        &mut self,
+        &self,
         id: &str,
         prefix: &str,
         record_ts: u64,
-        seen_in_record: &mut HashSet<String>,
-        out: &mut BTreeMap<String, AffectedFile>,
+        out: &mut HashMap<String, AffectedFile>,
         depth: usize,
     ) {
-        if depth > 512 || !self.tree_bad(id) {
+        if depth > 512 || !self.bad.get(id).copied().unwrap_or(false) {
             return;
         }
         let Some(info) = self.model.trees.get(id) else {
             return;
         };
         if info.broken {
-            self.note(
-                out,
-                seen_in_record,
-                format!("{prefix}/"),
-                &[info.self_blob],
-                record_ts,
-            );
+            self.note(out, format!("{prefix}/"), &[info.self_blob], record_ts);
             return;
         }
         for (name, blobs) in &info.files {
             if blobs.iter().any(|b| self.failures.contains_key(b)) {
-                let path = format!("{prefix}/{name}");
-                self.note(out, seen_in_record, path, blobs, record_ts);
+                self.note(out, format!("{prefix}/{name}"), blobs, record_ts);
             }
         }
-        let subs: Vec<(String, String)> = info.subtrees.clone();
-        for (name, sub) in subs {
+        for (name, sub) in &info.subtrees {
             let p = format!("{prefix}/{name}");
-            self.collect(&sub, &p, record_ts, seen_in_record, out, depth + 1);
+            self.collect(sub, &p, record_ts, out, depth + 1);
         }
     }
 
     fn note(
         &self,
-        out: &mut BTreeMap<String, AffectedFile>,
-        seen_in_record: &mut HashSet<String>,
+        out: &mut HashMap<String, AffectedFile>,
         path: String,
         blobs: &[u32],
         record_ts: u64,
     ) {
+        let bad_blobs: Vec<u32> = blobs
+            .iter()
+            .copied()
+            .filter(|b| self.failures.contains_key(b))
+            .collect();
         let mut kinds: Vec<FailKind> = Vec::new();
         let mut packs: Vec<String> = Vec::new();
-        for b in blobs {
-            if let Some(f) = self.failures.get(b) {
-                if !kinds.contains(&f.kind) {
-                    kinds.push(f.kind);
-                }
-                let p = self.model.interner.blobs[*b as usize].path.clone();
-                if !packs.contains(&p) {
-                    packs.push(p);
-                }
+        for b in &bad_blobs {
+            let f = &self.failures[b];
+            if !kinds.contains(&f.kind) {
+                kinds.push(f.kind);
+            }
+            let p = &self.model.interner.blobs[*b as usize].path;
+            if !packs.contains(p) {
+                packs.push(p.clone());
             }
         }
-        let first_in_record = seen_in_record.insert(path.clone());
-        let e = out.entry(path.clone()).or_insert_with(|| AffectedFile {
+        out.entry(path.clone()).or_insert_with(|| AffectedFile {
             path,
             newest_record: record_ts,
-            records_affected: 0,
+            records_affected: 1,
             kinds,
             packs,
-            blobs: blobs
-                .iter()
-                .copied()
-                .filter(|b| self.failures.contains_key(b))
-                .collect(),
+            blobs: bad_blobs,
         });
-        if first_in_record {
-            e.records_affected += 1;
-        }
-        if record_ts > e.newest_record {
-            e.newest_record = record_ts;
+    }
+}
+
+/// Merge `from` into `into`: counts add up, the newest record wins.
+fn merge_affected(
+    mut into: HashMap<String, AffectedFile>,
+    mut from: HashMap<String, AffectedFile>,
+) -> HashMap<String, AffectedFile> {
+    if into.len() < from.len() {
+        std::mem::swap(&mut into, &mut from);
+    }
+    for (k, v) in from {
+        match into.get_mut(&k) {
+            Some(e) => {
+                e.records_affected += v.records_affected;
+                e.newest_record = e.newest_record.max(v.newest_record);
+            }
+            None => {
+                into.insert(k, v);
+            }
         }
     }
+    into
 }
 
 // ---------------------------------------------------------------------------
@@ -939,22 +945,25 @@ pub fn run(opts: &VerifyOptions) -> Result<VerifyReport> {
         let mut impact = Impact {
             model: &model,
             failures: &failures,
-            memo: HashMap::new(),
+            bad: HashMap::new(),
         };
-        for r in records.iter().rev() {
+        for r in &records {
             if let Some(root) = &r.root {
-                let mut seen = HashSet::new();
-                let prefix = r.report.local_path.trim_end_matches('/').to_owned();
-                impact.collect(
-                    &root.identifier,
-                    &prefix,
-                    r.report.timestamp,
-                    &mut seen,
-                    &mut affected,
-                    0,
-                );
+                impact.mark_bad(&root.identifier);
             }
         }
+        let impact = &impact;
+        let merged = records
+            .par_iter()
+            .filter_map(|r| {
+                let root = r.root.as_ref()?;
+                let mut local = HashMap::new();
+                let prefix = r.report.local_path.trim_end_matches('/');
+                impact.collect(&root.identifier, prefix, r.report.timestamp, &mut local, 0);
+                Some(local)
+            })
+            .reduce(HashMap::new, merge_affected);
+        affected = merged.into_iter().collect();
     }
 
     if let Some(csv) = &opts.report_csv {
