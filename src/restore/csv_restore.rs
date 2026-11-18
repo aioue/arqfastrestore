@@ -524,7 +524,7 @@ pub fn items_from_csv(
         // Records are stored oldest-first; walk them newest-first so the
         // newest snapshot holding a requested (path, blob_sha) wins.
         let mut records: Vec<&crate::format::arq7::BackupRecord> = ctx.records.iter().collect();
-        records.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        records.sort_by_key(|r| std::cmp::Reverse(r.timestamp));
 
         // Rows still unmatched in this UUID. Tracked per row (not per path) so a
         // second version of the same path keeps being searched.
