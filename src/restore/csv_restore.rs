@@ -490,7 +490,8 @@ pub fn items_from_csv(
         let ctx = &uuid_contexts[&uuid];
 
         if ctx.records.is_empty() {
-            bail!("no snapshots for UUID {uuid}");
+            warn!("csv-restore: no snapshots for UUID {uuid} — skipping it");
+            continue;
         }
 
         let storage: std::sync::Arc<dyn Storage> =
@@ -506,15 +507,6 @@ pub fn items_from_csv(
             continue;
         }
 
-        // Build the per-path request map once — shared across all snapshot walks.
-        let requests_by_path: HashMap<String, Vec<RequestedRow>> = {
-            let mut m: HashMap<String, Vec<RequestedRow>> = HashMap::new();
-            for row in &relevant_rows {
-                m.entry(row.path.clone()).or_default().push(row.clone());
-            }
-            m
-        };
-
         eprintln!(
             "csv-restore: walking {} snapshots for UUID {uuid} in parallel ({} file(s) needed)...",
             ctx.records.len(),
@@ -529,20 +521,32 @@ pub fn items_from_csv(
         // After each chunk we check for early exit before starting the next.
         const SNAPSHOT_CHUNK_SIZE: usize = 4;
 
-        // row_id → path lookup for cheap early-exit updates.
-        let row_id_to_path: HashMap<usize, String> = relevant_rows
-            .iter()
-            .map(|r| (r.row_id, r.path.clone()))
-            .collect();
+        // Records are stored oldest-first; walk them newest-first so the
+        // newest snapshot holding a requested (path, blob_sha) wins.
+        let mut records: Vec<&crate::format::arq7::BackupRecord> = ctx.records.iter().collect();
+        records.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
 
-        // remaining_paths tracks which paths still need a snapshot match.
-        let mut remaining_paths: BTreeSet<String> = requests_by_path.keys().cloned().collect();
+        // Rows still unmatched in this UUID. Tracked per row (not per path) so a
+        // second version of the same path keeps being searched.
+        let mut remaining: HashMap<usize, RequestedRow> = relevant_rows
+            .iter()
+            .map(|r| (r.row_id, r.clone()))
+            .collect();
         // found_in_phase1: row_id → RestoreItem (first/newest match wins).
         let mut found_in_phase1: HashMap<usize, RestoreItem> = HashMap::new();
 
-        for chunk in ctx.records.chunks(SNAPSHOT_CHUNK_SIZE) {
-            if remaining_paths.is_empty() {
+        for chunk in records.chunks(SNAPSHOT_CHUNK_SIZE) {
+            if remaining.is_empty() {
                 break;
+            }
+
+            // Only the rows still unmatched, so later walks prune more.
+            let mut requests_by_path: HashMap<String, Vec<RequestedRow>> = HashMap::new();
+            for row in remaining.values() {
+                requests_by_path
+                    .entry(row.path.clone())
+                    .or_default()
+                    .push(row.clone());
             }
 
             let chunk_results: Vec<(usize, RestoreItem)> = chunk
@@ -581,16 +585,12 @@ pub fn items_from_csv(
                 })
                 .collect();
 
-            // Merge chunk results: first match per row_id wins (records are
-            // newest-first so first occurrence = most recent snapshot).
+            // Merge chunk results: first match per row_id wins. The chunk is
+            // newest-first and collect() keeps that order.
             for (row_id, item) in chunk_results {
-                if found_in_phase1.contains_key(&row_id) {
-                    continue;
+                if remaining.remove(&row_id).is_some() {
+                    found_in_phase1.insert(row_id, item);
                 }
-                if let Some(path) = row_id_to_path.get(&row_id) {
-                    remaining_paths.remove(path);
-                }
-                found_in_phase1.insert(row_id, item);
             }
         }
 
@@ -706,6 +706,124 @@ mod tests {
         };
 
         (dir, cache, ctx)
+    }
+
+    /// A context with one record per `(timestamp, sha, size)`; each record's
+    /// root tree holds a single `file.txt` with that first-blob sha and size.
+    fn test_context_with_records(
+        dir: &Path,
+        cache: &TreeCache,
+        records: &[(u64, &str, u64)],
+    ) -> UuidContext {
+        let mut recs = Vec::new();
+        for (ts, sha, size) in records {
+            let root = format!("root-{ts}");
+            cache.put(
+                &root,
+                &Tree {
+                    version: 2,
+                    nodes: vec![("file.txt".to_string(), test_file_node(sha, *size))],
+                },
+            );
+            recs.push(BackupRecord {
+                timestamp: *ts,
+                root_tree_blob_loc: Some(test_blob_loc(&root)),
+                local_path: "/src".to_string(),
+                arq_version: "arq7".to_string(),
+                is_complete: true,
+            });
+        }
+        UuidContext {
+            storage_root: dir.to_path_buf(),
+            decrypt: None,
+            parse_tree: std::sync::Arc::new(|_| anyhow::bail!("parse_tree should not be called in test")),
+            records: recs,
+        }
+    }
+
+    fn sha(c: char) -> String {
+        std::iter::repeat_n(c, 64).collect()
+    }
+
+    #[test]
+    fn items_from_csv_finds_versions_of_one_path_far_apart() {
+        // Version A only in the oldest record, B only in the newest, more than one
+        // snapshot chunk apart. Matching A must not stop the search for B.
+        let (a, b, c) = (sha('a'), sha('b'), sha('c'));
+        let dir = tempdir().unwrap();
+        let cache = TreeCache::open(&dir.path().join("trees.redb")).unwrap();
+        let ctx = test_context_with_records(
+            dir.path(),
+            &cache,
+            &[(1, &a, 1), (2, &c, 2), (3, &c, 3), (4, &c, 4), (5, &c, 5), (6, &b, 6)],
+        );
+        let csv_path = dir.path().join("test.csv");
+        std::fs::write(
+            &csv_path,
+            format!(
+                "action,path,blob_sha,sources,dest_as\nrestore,file.txt,{a},UUID1,old.txt\nrestore,file.txt,{b},UUID1,\n"
+            ),
+        )
+        .unwrap();
+        let mut contexts = HashMap::new();
+        contexts.insert("UUID1".to_string(), ctx);
+        let dest_root = dir.path().join("restore");
+
+        let (items, not_found) = items_from_csv(&csv_path, &dest_root, &contexts, Some(&cache)).unwrap();
+        assert!(not_found.is_empty(), "not found: {not_found:?}");
+        let mut sizes: Vec<u64> = items.iter().map(|i| i.node.item_size).collect();
+        sizes.sort();
+        assert_eq!(sizes, vec![1, 6]);
+    }
+
+    #[test]
+    fn items_from_csv_takes_node_from_newest_snapshot() {
+        // Same first-blob sha in every record: the newest record's node wins.
+        let a = sha('a');
+        let dir = tempdir().unwrap();
+        let cache = TreeCache::open(&dir.path().join("trees.redb")).unwrap();
+        let ctx = test_context_with_records(
+            dir.path(),
+            &cache,
+            &[(100, &a, 10), (200, &a, 20), (300, &a, 30), (400, &a, 40), (500, &a, 50)],
+        );
+        let csv_path = dir.path().join("test.csv");
+        std::fs::write(
+            &csv_path,
+            format!("action,path,blob_sha,sources,dest_as\nrestore,file.txt,{a},UUID1,\n"),
+        )
+        .unwrap();
+        let mut contexts = HashMap::new();
+        contexts.insert("UUID1".to_string(), ctx);
+
+        let (items, _) =
+            items_from_csv(&csv_path, &dir.path().join("restore"), &contexts, Some(&cache)).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].node.item_size, 50);
+    }
+
+    #[test]
+    fn items_from_csv_skips_uuid_without_snapshots() {
+        let a = sha('a');
+        let dir = tempdir().unwrap();
+        let cache = TreeCache::open(&dir.path().join("trees.redb")).unwrap();
+        let empty = test_context_with_records(dir.path(), &cache, &[]);
+        let hit = test_context_with_records(dir.path(), &cache, &[(1, &a, 7)]);
+        let csv_path = dir.path().join("test.csv");
+        std::fs::write(
+            &csv_path,
+            format!("action,path,blob_sha,sources,dest_as\nrestore,file.txt,{a},EMPTY;HIT,\n"),
+        )
+        .unwrap();
+        let mut contexts = HashMap::new();
+        contexts.insert("EMPTY".to_string(), empty);
+        contexts.insert("HIT".to_string(), hit);
+
+        let (items, not_found) =
+            items_from_csv(&csv_path, &dir.path().join("restore"), &contexts, Some(&cache)).unwrap();
+        assert!(not_found.is_empty());
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].node.item_size, 7);
     }
 
     // -----------------------------------------------------------------------
