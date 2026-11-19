@@ -80,3 +80,11 @@ data.
   calibration from `verify`, or degrade to a warning.
 - Classify HMAC-only damage (stored HMAC bytes damaged, ciphertext intact).
   Needs an HMAC-skipping decrypt path guarded by the identifier check.
+- Optional `--no-page-cache` for `verify` (macOS `F_NOCACHE` on pack reads). A
+  verify run streams ~300 GB through 17 GB of RAM. Earlier A/B on the software
+  crypto build: no speed change (175.7 s vs 178.6 s), peak RSS 1.41 vs 1.76 GB.
+  Not re-tested on the hardware-crypto build, where the run is I/O-bound, so
+  the effect may differ. Prototype patch was dropped, not merged; re-implement
+  as an opt-in flag (`VerifyOptions.no_page_cache`, `libc::fcntl(fd,
+  F_NOCACHE, 1)` after opening each pack) and A/B alternately (cache and
+  nocache, 2 runs each) before making it a default.
