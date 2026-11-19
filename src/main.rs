@@ -253,6 +253,21 @@ enum Commands {
         /// Disable the persistent tree cache
         #[arg(long)]
         no_cache: bool,
+
+        /// Number of parallel worker threads (default: number of CPU cores)
+        #[arg(short = 'j', long)]
+        threads: Option<usize>,
+
+        /// Print detailed timing and I/O statistics after the restore
+        #[arg(long)]
+        verbose: bool,
+
+        /// Number of pack files to process concurrently (default: 1).
+        ///
+        /// Use 1 (default) for spinning disks and USB storage. Use 4-8 for
+        /// SSDs or fast network storage.
+        #[arg(long, default_value = "1")]
+        pack_concurrency: usize,
     },
     /// Restore specific files from a scan CSV (rows with action=restore)
     RestoreFromCsv {
@@ -657,8 +672,17 @@ fn main() -> Result<()> {
             dry_run,
             cache_path,
             no_cache,
+            threads,
+            verbose,
+            pack_concurrency,
         } => {
             let password = resolve_password(password, password_file)?;
+            if let Some(n) = threads {
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(n)
+                    .build_global()
+                    .ok();
+            }
             let bp = PathBuf::from(&backup_path);
             let keys = match detect_format(&bp, &password)? {
                 BackupFormat::Arq7(k) => Some(k),
@@ -674,6 +698,8 @@ fn main() -> Result<()> {
                 dry_run,
                 cache_path,
                 no_cache,
+                verbose,
+                pack_concurrency,
             )
         }
         Commands::RestoreFromCsv {
@@ -2124,6 +2150,8 @@ fn restore_path_arq7(
     dry_run: bool,
     cache_path: Option<String>,
     no_cache: bool,
+    verbose: bool,
+    pack_concurrency: usize,
 ) -> Result<()> {
     let sel = parse_record_selector(record_sel)?;
     let storage = LocalStorage::new(backup_path);
@@ -2152,7 +2180,7 @@ fn restore_path_arq7(
         keys.map(|k| -> DecryptFn { Arc::new(move |data: &[u8]| decrypt_arq7_object(data, &k)) });
     use crate::format::arq7::Tree;
     let parse_tree: TreeParseFn = Arc::new(|data: &[u8]| Tree::parse(data));
-    let cache = open_tree_cache(no_cache, cache_path, false)?;
+    let cache = open_tree_cache(no_cache, cache_path, verbose)?;
 
     let reader = storage::BlobReader::new(storage_arc.clone(), decrypt.clone());
     let items = restore::collect_path_items(
@@ -2178,10 +2206,10 @@ fn restore_path_arq7(
         decrypt,
         PathBuf::from(dest),
         dry_run,
-        false,
+        verbose,
         cache,
         parse_tree,
-        1,
+        pack_concurrency,
     );
     let stats = engine.restore_items(items)?;
     print_restore_stats(&stats, dry_run);
