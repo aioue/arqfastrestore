@@ -110,6 +110,9 @@ arqfastrestore restore-path \
 `--record` is a Unix timestamp, `latest`, `before:<rfc3339>` (newest record strictly before) or `near:<rfc3339>`.
 The relative path is recreated under `--dest`. Drop `--dry-run` to write.
 
+Also accepted: `--threads`/`-j`, `--verbose` (timing and I/O statistics),
+`--pack-concurrency` and `--verify` (see below), plus `--no-cache`.
+
 ### Restore a backup
 
 ```bash
@@ -134,8 +137,7 @@ arqfastrestore restore \
 | `--verbose` | Print detailed timing and I/O statistics after restore |
 | `--cache-path` | Override tree cache location (default: `~/.cache/arqfastrestore/`) |
 | `--no-cache` | Disable persistent tree cache |
-
-| `--verify` | Check every blob's content against its identifier (`sha256(salt‖data)`) while restoring; Arq 7 encrypted repos only. HMAC is always checked. |
+| `--verify` | Check every blob's content against its identifier while restoring; Arq 7 encrypted repos only. HMAC is always checked. Also available on `restore-path` and `restore-from-csv`. The identifier formula is calibrated on the repository's root trees first (same as `verify`); if it cannot be reproduced the identifier check is skipped with a warning instead of failing every file. |
 
 ### Verify a repository (read-only)
 

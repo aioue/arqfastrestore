@@ -13,6 +13,7 @@ use tracing_subscriber::EnvFilter;
 
 mod crypto;
 mod format;
+mod identifier;
 mod restore;
 mod scan;
 mod storage;
@@ -268,6 +269,13 @@ enum Commands {
         /// SSDs or fast network storage.
         #[arg(long, default_value = "1")]
         pack_concurrency: usize,
+
+        /// Verify every blob's content against its identifier while restoring,
+        /// on top of the always-on HMAC check. The identifier formula is
+        /// calibrated on the repository first; if it cannot be reproduced the
+        /// identifier check is skipped with a warning. Arq 7 encrypted only.
+        #[arg(long)]
+        verify: bool,
     },
     /// Restore specific files from a scan CSV (rows with action=restore)
     RestoreFromCsv {
@@ -310,6 +318,13 @@ enum Commands {
         /// Number of pack files to process concurrently (default: 1)
         #[arg(long, default_value = "1")]
         pack_concurrency: usize,
+
+        /// Verify every blob's content against its identifier while restoring,
+        /// on top of the always-on HMAC check. The identifier formula is
+        /// calibrated per plan first; if it cannot be reproduced the identifier
+        /// check is skipped for that plan with a warning. Arq 7 encrypted only.
+        #[arg(long)]
+        verify: bool,
     },
 }
 
@@ -563,7 +578,15 @@ fn main() -> Result<()> {
             if verify {
                 match &fmt {
                     BackupFormat::Arq7(keys) => {
-                        storage::enable_identifier_verification(keys.keys[2].clone());
+                        let folders = list_backup_folders_all_plans(
+                            &LocalStorage::new(&backup_path),
+                            Some(keys),
+                        )?;
+                        arm_identifier_check(
+                            &arq7_storage_root(&backup_path),
+                            keys,
+                            folders.iter().flat_map(|(_, _, recs)| recs.iter()),
+                        );
                     }
                     _ => bail!("--verify needs an encrypted Arq 7 repository"),
                 }
@@ -675,6 +698,7 @@ fn main() -> Result<()> {
             threads,
             verbose,
             pack_concurrency,
+            verify,
         } => {
             let password = resolve_password(password, password_file)?;
             if let Some(n) = threads {
@@ -689,6 +713,9 @@ fn main() -> Result<()> {
                 BackupFormat::Unencrypted => None,
                 BackupFormat::Arq5(_) => bail!("restore-path supports Arq7 backups only"),
             };
+            if verify && keys.is_none() {
+                bail!("--verify needs an encrypted Arq 7 repository");
+            }
             restore_path_arq7(
                 &backup_path,
                 keys,
@@ -700,6 +727,7 @@ fn main() -> Result<()> {
                 no_cache,
                 verbose,
                 pack_concurrency,
+                verify,
             )
         }
         Commands::RestoreFromCsv {
@@ -712,6 +740,7 @@ fn main() -> Result<()> {
             dry_run,
             verbose,
             pack_concurrency,
+            verify,
         } => {
             let password = resolve_password(password, password_file)?;
             if let Some(n) = threads {
@@ -729,6 +758,7 @@ fn main() -> Result<()> {
                 dry_run,
                 verbose,
                 pack_concurrency,
+                verify,
             )?;
             Ok(())
         }
@@ -738,6 +768,85 @@ fn main() -> Result<()> {
 // ---------------------------------------------------------------------------
 // Restore-from-CSV path
 // ---------------------------------------------------------------------------
+
+/// Storage root for an Arq 7 plan: blob `relativePath`s include the plan UUID
+/// directory, so the root is the parent of the plan directory.
+fn arq7_storage_root(plan_dir: &str) -> PathBuf {
+    PathBuf::from(plan_dir)
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from(plan_dir))
+}
+
+/// Arm `--verify` for one Arq 7 plan.
+///
+/// The blob-identifier formula is calibrated the same way `verify` does it
+/// (see [`identifier`]): the root trees named by the backup records are read
+/// and the first candidate formula that reproduces all of their identifiers is
+/// used. If no formula fits (or no root tree can be read), a warning is printed
+/// and the identifier check stays off for this plan; the always-on HMAC check
+/// still runs. Returns whether the check was armed.
+fn arm_identifier_check<'a>(
+    storage_root: &Path,
+    keys: &Arq7Keys,
+    records: impl IntoIterator<Item = &'a BackupRecord>,
+) -> bool {
+    use identifier::{Sample, pick_formula};
+    use std::collections::HashSet;
+
+    let owned = Arq7Keys {
+        keys: keys.keys.clone(),
+    };
+    let storage: Arc<dyn storage::Storage> = Arc::new(LocalStorage::new(storage_root));
+    let decrypt: DecryptFn = Arc::new(move |data: &[u8]| decrypt_arq7_object(data, &owned));
+    let reader = storage::BlobReader::new(storage, Some(decrypt));
+
+    // Newest records first: they are the most likely to be intact.
+    let mut records: Vec<&BackupRecord> = records.into_iter().collect();
+    records.sort_by_key(|r| std::cmp::Reverse(r.timestamp));
+
+    let mut seen = HashSet::new();
+    let mut parts: Vec<(String, Vec<u8>, Vec<u8>)> = Vec::new();
+    for loc in records.iter().filter_map(|r| r.root_tree_blob_loc.as_ref()) {
+        if parts.len() >= 64 {
+            break;
+        }
+        if !seen.insert(loc.identifier.clone()) {
+            continue;
+        }
+        if let Ok((comp, plain)) = reader.read_blob_parts(loc) {
+            parts.push((loc.identifier.clone(), comp, plain));
+        }
+    }
+    let samples: Vec<Sample> = parts
+        .iter()
+        .map(|(id, comp, plain)| Sample {
+            identifier: id,
+            comp,
+            plain,
+        })
+        .collect();
+    match pick_formula(&keys.keys[2], &samples) {
+        Some(f) => {
+            eprintln!(
+                "verify: blob identifier = {} (calibrated on {} root tree(s))",
+                f.name(),
+                samples.len()
+            );
+            storage::enable_identifier_verification(keys.keys[2].clone(), f);
+            true
+        }
+        None => {
+            eprintln!(
+                "warning: --verify could not reproduce the blob identifiers of {} root tree(s) in {}; \
+                 identifier check disabled for this plan (HMAC check still on)",
+                samples.len(),
+                storage_root.display()
+            );
+            false
+        }
+    }
+}
 
 /// Restore specific files listed in a scan CSV (rows with `action=restore`).
 ///
@@ -755,6 +864,7 @@ fn restore_from_csv(
     dry_run: bool,
     verbose: bool,
     pack_concurrency: usize,
+    verify: bool,
 ) -> Result<()> {
     use restore::csv_restore::UuidContext;
 
@@ -784,6 +894,7 @@ fn restore_from_csv(
     // - Arq5: bucket UUIDs
     let mut uuid_contexts: std::collections::HashMap<String, UuidContext> =
         std::collections::HashMap::new();
+    let mut verify_armed = false;
 
     for uuid_dir in &uuid_dirs {
         let uuid_name = uuid_dir
@@ -796,11 +907,31 @@ fn restore_from_csv(
             match detect_format(uuid_dir, pw) {
                 Err(_) => continue,
                 Ok(fmt) => {
+                    let verify_keys = match &fmt {
+                        BackupFormat::Arq7(k) => Some(Arq7Keys {
+                            keys: k.keys.clone(),
+                        }),
+                        _ => None,
+                    };
                     match build_uuid_contexts(uuid_dir, &storage_root_arq7, &uuid_name, fmt) {
                         Err(e) => {
                             tracing::warn!("csv-restore: skipping {uuid_name}: {e}");
                         }
                         Ok(contexts) => {
+                            if verify {
+                                match &verify_keys {
+                                    Some(k) => {
+                                        verify_armed |= arm_identifier_check(
+                                            &storage_root_arq7,
+                                            k,
+                                            contexts.iter().flat_map(|(_, c)| c.records.iter()),
+                                        );
+                                    }
+                                    None => eprintln!(
+                                        "warning: --verify skipped for {uuid_name}: needs an encrypted Arq 7 repository"
+                                    ),
+                                }
+                            }
                             for (source_uuid, ctx) in contexts {
                                 uuid_contexts.insert(source_uuid, ctx);
                             }
@@ -818,6 +949,9 @@ fn restore_from_csv(
 
     if uuid_contexts.is_empty() {
         bail!("No accessible backup sets found — check --backup-path and --password");
+    }
+    if verify && !verify_armed {
+        eprintln!("warning: --verify is not active for any backup set; only the HMAC check runs");
     }
 
     let cache = open_tree_cache(false, None, verbose)?;
@@ -2152,10 +2286,18 @@ fn restore_path_arq7(
     no_cache: bool,
     verbose: bool,
     pack_concurrency: usize,
+    verify: bool,
 ) -> Result<()> {
     let sel = parse_record_selector(record_sel)?;
     let storage = LocalStorage::new(backup_path);
     let folders = list_backup_folders_all_plans(&storage, keys.as_ref())?;
+    if verify && let Some(k) = keys.as_ref() {
+        arm_identifier_check(
+            &arq7_storage_root(backup_path),
+            k,
+            folders.iter().flat_map(|(_, _, recs)| recs.iter()),
+        );
+    }
     let record = select_record_by(&folders, &sel)
         .with_context(|| format!("no backup record matches --record {record_sel}"))?;
     println!(

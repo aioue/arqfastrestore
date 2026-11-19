@@ -31,11 +31,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use anyhow::{Context, Result};
 use rayon::prelude::*;
 use serde::Serialize;
-use sha2::{Digest, Sha256};
 
 use crate::crypto::{Arq7Keys, decrypt_arq7_object};
 use crate::format::arq7::{BlobLoc, Tree, decompress_blob, decompress_lz4};
 use crate::format::backup_record::parse_backup_record_bytes;
+use crate::identifier::{IdFormula, Sample, pick_formula};
 
 const ARQO_MAGIC: &[u8] = b"ARQO";
 /// A run of at least this many zero bytes inside a damaged blob is reported.
@@ -124,68 +124,6 @@ fn zero_stats(raw: &[u8]) -> (bool, u64) {
         best == raw.len(),
         if best >= MIN_ZERO_RUN { best as u64 } else { 0 },
     )
-}
-
-// ---------------------------------------------------------------------------
-// Blob identifier formula (established empirically per repository)
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum IdFormula {
-    /// SHA256(plaintext)
-    Plain,
-    /// SHA256(salt || plaintext)
-    SaltPrefix,
-    /// SHA256(plaintext || salt)
-    SaltSuffix,
-    /// SHA256(salt || compressed-plaintext)
-    CompSaltPrefix,
-    /// SHA256(compressed-plaintext || salt)
-    CompSaltSuffix,
-}
-
-const ID_FORMULAS: [IdFormula; 5] = [
-    IdFormula::Plain,
-    IdFormula::SaltPrefix,
-    IdFormula::SaltSuffix,
-    IdFormula::CompSaltPrefix,
-    IdFormula::CompSaltSuffix,
-];
-
-impl IdFormula {
-    fn name(self) -> &'static str {
-        match self {
-            IdFormula::Plain => "sha256(plaintext)",
-            IdFormula::SaltPrefix => "sha256(salt||plaintext)",
-            IdFormula::SaltSuffix => "sha256(plaintext||salt)",
-            IdFormula::CompSaltPrefix => "sha256(salt||compressed plaintext)",
-            IdFormula::CompSaltSuffix => "sha256(compressed plaintext||salt)",
-        }
-    }
-
-    fn compute(self, salt: &[u8], comp: &[u8], plain: &[u8]) -> String {
-        let mut h = Sha256::new();
-        match self {
-            IdFormula::Plain => h.update(plain),
-            IdFormula::SaltPrefix => {
-                h.update(salt);
-                h.update(plain);
-            }
-            IdFormula::SaltSuffix => {
-                h.update(plain);
-                h.update(salt);
-            }
-            IdFormula::CompSaltPrefix => {
-                h.update(salt);
-                h.update(comp);
-            }
-            IdFormula::CompSaltSuffix => {
-                h.update(comp);
-                h.update(salt);
-            }
-        }
-        hex::encode(h.finalize())
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -841,12 +779,15 @@ fn calibrate_formula(opts: &VerifyOptions, roots: &[BlobLoc]) -> Option<IdFormul
     if samples.is_empty() {
         return None;
     }
-    ID_FORMULAS.into_iter().find(|f| {
-        samples.iter().all(|(loc, fetched)| {
-            f.compute(&opts.keys.keys[2], &fetched.comp, &fetched.plain)
-                .eq_ignore_ascii_case(&loc.identifier)
+    let picked: Vec<Sample> = samples
+        .iter()
+        .map(|(loc, fetched)| Sample {
+            identifier: &loc.identifier,
+            comp: &fetched.comp,
+            plain: &fetched.plain,
         })
-    })
+        .collect();
+    pick_formula(&opts.keys.keys[2], &picked)
 }
 
 // ---------------------------------------------------------------------------

@@ -76,8 +76,6 @@ data.
   directory cannot block its own children.
 - BlobReader pack cache eviction picks an arbitrary entry. Use LRU or oldest
   inserted.
-- `restore --verify` hardcodes `sha256(salt || plaintext)`. Reuse the
-  calibration from `verify`, or degrade to a warning.
 - Classify HMAC-only damage (stored HMAC bytes damaged, ciphertext intact).
   Needs an HMAC-skipping decrypt path guarded by the identifier check.
 - Optional `--no-page-cache` for `verify` (macOS `F_NOCACHE` on pack reads). A

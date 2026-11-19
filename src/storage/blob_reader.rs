@@ -26,6 +26,7 @@ use std::time::Instant;
 use anyhow::{Context, Result, bail};
 
 use crate::format::arq7::{BlobLoc, decompress_blob};
+use crate::identifier::IdFormula;
 use crate::storage::Storage;
 
 /// A pluggable decryption function.
@@ -35,40 +36,59 @@ use crate::storage::Storage;
 /// `"encrypted"` prefix and call `decrypt_arq5_object`.
 pub type DecryptFn = Arc<dyn Fn(&[u8]) -> Result<Vec<u8>> + Send + Sync>;
 
-/// Blob-identifier salt used to verify every blob read (`restore --verify`).
+/// Blob-identifier checks enabled for this process (`restore --verify`).
 ///
-/// Arq 7 identifies a blob by `sha256(salt || plaintext)` (hex). When set,
-/// [`BlobReader::read_blob`] recomputes it after decompression and fails the read
-/// on a mismatch. HMAC verification of encrypted blobs is always on; this adds
-/// an end-to-end content check. Process-wide because readers are created in
-/// several places.
-static VERIFY_SALT: OnceLock<Vec<u8>> = OnceLock::new();
+/// Each entry is a plan's `(salt, formula)`; the formula was calibrated against
+/// that plan's root trees (see [`crate::identifier`]). When any entry is
+/// registered, [`BlobReader::read_blob`] recomputes the identifier after
+/// decompression and fails the read if no registered entry reproduces it.
+/// HMAC verification of encrypted blobs is always on; this adds an end-to-end
+/// content check. Process-wide because readers are created in several places,
+/// and a list because one `restore-from-csv` run can span several plans, each
+/// with its own salt: a blob passes when its plan's entry matches, and a wrong
+/// blob cannot match under another plan's salt.
+static VERIFY_ENTRIES: RwLock<Vec<(Vec<u8>, IdFormula)>> = RwLock::new(Vec::new());
 
-/// Turn on blob-identifier verification for all readers in this process.
-pub fn enable_identifier_verification(salt: Vec<u8>) {
-    let _ = VERIFY_SALT.set(salt);
+/// Turn on blob-identifier verification for a plan, for all readers in this process.
+pub fn enable_identifier_verification(salt: Vec<u8>, formula: IdFormula) {
+    let mut entries = VERIFY_ENTRIES.write().unwrap_or_else(|e| e.into_inner());
+    if !entries.iter().any(|(s, f)| *s == salt && *f == formula) {
+        entries.push((salt, formula));
+    }
 }
 
-fn check_blob_identifier(loc: &BlobLoc, plain: &[u8]) -> Result<()> {
-    use sha2::{Digest, Sha256};
-    let Some(salt) = VERIFY_SALT.get() else {
+fn check_blob_identifier(loc: &BlobLoc, comp: &[u8], plain: &[u8]) -> Result<()> {
+    let entries = VERIFY_ENTRIES.read().unwrap_or_else(|e| e.into_inner());
+    check_against(&entries, loc, comp, plain)
+}
+
+/// Pure core of [`check_blob_identifier`]: no entries means no check.
+fn check_against(
+    entries: &[(Vec<u8>, IdFormula)],
+    loc: &BlobLoc,
+    comp: &[u8],
+    plain: &[u8],
+) -> Result<()> {
+    if entries.is_empty() {
         return Ok(());
-    };
+    }
     // Only Arq 7 (SHA-256, 64 hex chars); Arq 5 identifiers are SHA-1.
     if loc.identifier.len() != 64 || loc.is_arq5_pack_entry {
         return Ok(());
     }
-    let mut h = Sha256::new();
-    h.update(salt);
-    h.update(plain);
-    let got = hex::encode(h.finalize());
-    if !got.eq_ignore_ascii_case(&loc.identifier) {
-        bail!(
-            "blob identifier mismatch: expected {}, content hashes to {got}",
-            loc.identifier
-        );
+    let mut first = None;
+    for (salt, formula) in entries {
+        let got = formula.compute(salt, comp, plain);
+        if got.eq_ignore_ascii_case(&loc.identifier) {
+            return Ok(());
+        }
+        first.get_or_insert(got);
     }
-    Ok(())
+    bail!(
+        "blob identifier mismatch: expected {}, content hashes to {}",
+        loc.identifier,
+        first.unwrap_or_default()
+    )
 }
 
 /// Magic bytes that mark an ARQO-encrypted payload.
@@ -195,6 +215,18 @@ impl BlobReader {
     /// - The payload is ARQO-encrypted but no decryption function was provided.
     /// - Decryption or decompression fails.
     pub fn read_blob(&self, loc: &BlobLoc) -> Result<Vec<u8>> {
+        let (comp, plain) = self.read_blob_parts(loc)?;
+        check_blob_identifier(loc, &comp, &plain)?;
+        // Track logical bytes produced (the useful output).
+        self.stats
+            .logical_bytes_out
+            .fetch_add(plain.len() as u64, Ordering::Relaxed);
+        Ok(plain)
+    }
+
+    /// Like [`read_blob`] but returns `(compressed, plaintext)` and performs no
+    /// identifier check. Used to calibrate the identifier formula.
+    pub fn read_blob_parts(&self, loc: &BlobLoc) -> Result<(Vec<u8>, Vec<u8>)> {
         self.stats.total_reads.fetch_add(1, Ordering::Relaxed);
 
         let path = loc.relative_path.as_deref().unwrap_or(&loc.identifier);
@@ -236,18 +268,7 @@ impl BlobReader {
             decompress_blob(&decrypted, loc.compression_type)
         };
 
-        if let Ok(ref data) = result {
-            check_blob_identifier(loc, data)?;
-        }
-
-        // Track logical bytes produced (the useful output).
-        if let Ok(ref data) = result {
-            self.stats
-                .logical_bytes_out
-                .fetch_add(data.len() as u64, Ordering::Relaxed);
-        }
-
-        result
+        result.map(|plain| (decrypted, plain))
     }
 
     /// Same as [`read_blob`] but returns `None` if `loc` is `None` or if the
@@ -894,5 +915,71 @@ mod tests {
             msg.contains("no decryption function was provided"),
             "unexpected error: {msg}"
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // Identifier check (pure core; the process-wide list is not touched)
+    // -------------------------------------------------------------------------
+
+    fn loc_with_id(id: &str) -> BlobLoc {
+        let mut l = make_loc("p", false, 0, 0, 0);
+        l.identifier = id.to_string();
+        l
+    }
+
+    #[test]
+    fn identifier_check_accepts_matching_and_rejects_changed_content() {
+        let salt = b"salt".to_vec();
+        let id = IdFormula::SaltPrefix.compute(&salt, b"comp", b"plain");
+        let entries = vec![(salt, IdFormula::SaltPrefix)];
+        assert!(check_against(&entries, &loc_with_id(&id), b"comp", b"plain").is_ok());
+        let err = check_against(&entries, &loc_with_id(&id), b"comp", b"PLAIN")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("blob identifier mismatch"), "{err}");
+    }
+
+    #[test]
+    fn identifier_check_uses_the_calibrated_formula() {
+        let salt = b"salt".to_vec();
+        // A repository whose identifiers are over the compressed payload.
+        let id = IdFormula::CompSaltPrefix.compute(&salt, b"comp", b"plain");
+        let wrong = vec![(salt.clone(), IdFormula::SaltPrefix)];
+        let right = vec![(salt, IdFormula::CompSaltPrefix)];
+        assert!(check_against(&wrong, &loc_with_id(&id), b"comp", b"plain").is_err());
+        assert!(check_against(&right, &loc_with_id(&id), b"comp", b"plain").is_ok());
+    }
+
+    #[test]
+    fn identifier_check_with_several_plans_matches_any_but_still_rejects_bad_content() {
+        let a = b"salt-a".to_vec();
+        let b = b"salt-b".to_vec();
+        let id_b = IdFormula::SaltPrefix.compute(&b, b"c", b"p");
+        let entries = vec![(a, IdFormula::SaltPrefix), (b, IdFormula::SaltPrefix)];
+        assert!(check_against(&entries, &loc_with_id(&id_b), b"c", b"p").is_ok());
+        assert!(check_against(&entries, &loc_with_id(&id_b), b"c", b"other").is_err());
+    }
+
+    #[test]
+    fn identifier_check_is_off_without_entries_and_skips_non_sha256() {
+        let id = "0".repeat(64);
+        assert!(check_against(&[], &loc_with_id(&id), b"c", b"p").is_ok());
+        let entries = vec![(b"s".to_vec(), IdFormula::SaltPrefix)];
+        // 40-hex (Arq 5 / SHA-1) identifiers are not checked.
+        assert!(check_against(&entries, &loc_with_id(&"0".repeat(40)), b"c", b"p").is_ok());
+        let mut a5 = loc_with_id(&id);
+        a5.is_arq5_pack_entry = true;
+        assert!(check_against(&entries, &a5, b"c", b"p").is_ok());
+    }
+
+    #[test]
+    fn read_blob_parts_returns_compressed_and_plain_bytes() {
+        let mut storage = MockStorage::new();
+        storage.insert("blob", b"hello".to_vec());
+        let reader = BlobReader::new(Arc::new(storage), None);
+        let loc = make_loc("blob", false, 0, 5, 0);
+        let (comp, plain) = reader.read_blob_parts(&loc).unwrap();
+        assert_eq!(comp, b"hello");
+        assert_eq!(plain, b"hello");
     }
 }

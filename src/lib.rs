@@ -6,5 +6,6 @@
 
 pub mod crypto;
 pub mod format;
+pub mod identifier;
 pub mod restore;
 pub mod storage;
