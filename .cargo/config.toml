@@ -1,0 +1,5 @@
+# Use the ARMv8 AES instructions on Apple Silicon / aarch64 (aes 0.8 needs this
+# cfg; it falls back to software at runtime if the CPU lacks them). Note that a
+# RUSTFLAGS environment variable overrides this setting.
+[target.'cfg(target_arch = "aarch64")']
+rustflags = ["--cfg", "aes_armv8"]

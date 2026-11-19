@@ -229,6 +229,21 @@ fn stored_range(loc: &BlobLoc, size: u64, path: &str) -> Result<(u64, u64), Blob
     Ok((offset, length))
 }
 
+/// Seconds since the first log line, so phase times can be read off the log.
+fn log_elapsed() -> f64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_secs_f64()
+}
+
+macro_rules! vlog {
+    ($($arg:tt)*) => {
+        eprintln!("[{:8.1}s] {}", log_elapsed(), format_args!($($arg)*))
+    };
+}
+
 /// Fetch the stored bytes of `loc` from an already-open file of `size` bytes.
 fn read_stored(file: &File, size: u64, loc: &BlobLoc, path: &str) -> Result<Vec<u8>, BlobFailure> {
     let (offset, length) = stored_range(loc, size, path)?;
@@ -735,7 +750,7 @@ fn walk_trees(opts: &VerifyOptions, roots: &[BlobLoc], formula: Option<IdFormula
     let mut level = 0usize;
     while !frontier.is_empty() {
         level += 1;
-        eprintln!(
+        vlog!(
             "verify: tree level {level}: {} trees ({} done)",
             frontier.len(),
             model.trees.len()
@@ -853,7 +868,7 @@ fn verify_blobs(
         by_path.entry(&b.path).or_default().push(i);
     }
     let total: usize = by_path.values().map(Vec::len).sum();
-    eprintln!("verify: checking {total} blobs in {} files", by_path.len());
+    vlog!("verify: checking {total} blobs in {} files", by_path.len());
 
     let done = AtomicUsize::new(0);
     let bytes = std::sync::atomic::AtomicU64::new(0);
@@ -881,7 +896,7 @@ fn verify_blobs(
                 }
                 let n = done.fetch_add(1, Ordering::Relaxed) + 1;
                 if n.is_multiple_of(25_000) {
-                    eprintln!("verify: {n}/{total} blobs checked");
+                    vlog!("verify: {n}/{total} blobs checked");
                 }
             });
             out
@@ -1070,7 +1085,7 @@ pub fn run(opts: &VerifyOptions) -> Result<VerifyReport> {
 
     // Phase 1
     let record_paths = collect_record_paths(&opts.plan_dir);
-    eprintln!("verify: reading {} backup records", record_paths.len());
+    vlog!("verify: reading {} backup records", record_paths.len());
     let mut records: Vec<RecordInfo> = record_paths
         .par_iter()
         .map(|p| read_record(p, &opts.keys))
@@ -1079,7 +1094,7 @@ pub fn run(opts: &VerifyOptions) -> Result<VerifyReport> {
     if let Some(n) = opts.latest {
         let skip = records.len().saturating_sub(n);
         records.drain(..skip);
-        eprintln!("verify: limited to the newest {} records", records.len());
+        vlog!("verify: limited to the newest {} records", records.len());
     }
 
     let roots: Vec<BlobLoc> = records.iter().filter_map(|r| r.root.clone()).collect();
@@ -1088,8 +1103,8 @@ pub fn run(opts: &VerifyOptions) -> Result<VerifyReport> {
     let formula = if want_id_check {
         let f = calibrate_formula(opts, &roots);
         match f {
-            Some(f) => eprintln!("verify: blob identifier = {}", f.name()),
-            None => eprintln!(
+            Some(f) => vlog!("verify: blob identifier = {}", f.name()),
+            None => vlog!(
                 "verify: could not reproduce blob identifiers from root trees; identifier check disabled"
             ),
         }
@@ -1098,7 +1113,7 @@ pub fn run(opts: &VerifyOptions) -> Result<VerifyReport> {
         None
     };
     let model = walk_trees(opts, &roots, formula);
-    eprintln!(
+    vlog!(
         "verify: {} distinct trees, {} distinct blobs referenced",
         model.trees.len(),
         model.interner.blobs.len()
@@ -1149,7 +1164,7 @@ pub fn run(opts: &VerifyOptions) -> Result<VerifyReport> {
     // Impact: newest record first so `newest_record` is right and counts cover every record.
     let mut affected: BTreeMap<String, AffectedFile> = BTreeMap::new();
     if !failures.is_empty() {
-        eprintln!(
+        vlog!(
             "verify: {} bad blobs; mapping them to files in {} records",
             failures.len(),
             records.len()
@@ -1178,9 +1193,11 @@ pub fn run(opts: &VerifyOptions) -> Result<VerifyReport> {
             .reduce(HashMap::new, merge_affected);
         affected = merged.into_iter().collect();
     }
+    vlog!("verify: mapped damage to {} affected paths", affected.len());
 
     if let Some(csv) = &opts.report_csv {
         write_csv(csv, &model, &failures, &copies, &affected)?;
+        vlog!("verify: CSV written");
     }
 
     let records_unreadable = records
