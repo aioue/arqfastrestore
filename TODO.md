@@ -43,6 +43,31 @@ same blob in another pack: restore must produce identical bytes. Also a corrupte
 alternate (must be rejected by the identifier check) and an index entry that no
 longer exists.
 
+**Status (2026-11-19).** Deferred, not started. Arq's own Validate (7.51.1) was
+run against the damaged repo and repaired nothing: it only reports the same
+missing and zeroed objects and skips them, and a following backup logs "Errors
+occurred; not applying retention rules" so nothing is pruned. Arq never repoints
+a snapshot at another copy, so this tool is the only route to the recoverable
+data.
+
+**Plan.**
+1. Opus 5.5 (medium or high) delegate implements it on a branch (for example
+   `intact-copy-fallback`), small commits, no push or merge, unit tests on
+   synthetic plans only.
+   - Index: identifier -> alternate BlobLocs, built during the tree walk
+     (extend the `verify` interner; consider also indexing duplicate tree
+     locations).
+   - Fallback in `BlobReader::read_blob`: try alternates after a failed read,
+     accept only a copy that passes HMAC, decrypt, decompress and the identifier
+     check, and log each fallback.
+   - Flag `--use-intact-copies` on `restore`, `restore-path` and
+     `restore-from-csv`; off by default.
+2. A Sonnet 5.5 high delegate reviews the branch and fixes major bugs.
+3. Run `verify` on the real repo with `/usr/bin/time -l` for the baseline, then
+   a trial `restore-path` on a damaged path from a non-critical snapshot, to a
+   scratch directory, and diff against the intact copy.
+4. Only then merge to `master`.
+
 ## Smaller items
 
 - `Impact::collect` silently stops at depth 512, so deeper damaged files are
